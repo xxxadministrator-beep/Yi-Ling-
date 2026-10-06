@@ -1,0 +1,17 @@
+name = "yi-ling"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "yiling"
+database_id = "REPLACE_WITH_DATABASE_ID"
+
+[vars]
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL = "deepseek-chat"
