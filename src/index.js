@@ -656,14 +656,15 @@ function publicUser(user) {
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-function json(data, status = 200) {
+function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      ...extraHeaders,
     },
   });
 }
@@ -673,10 +674,39 @@ function corsOptions() {
     status: 204,
     headers: {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, Authorization",
     },
   });
+}
+
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  for (const part of header.split(";")) {
+    const index = part.indexOf("=");
+    if (index < 0) continue;
+    const key = part.slice(0, index).trim();
+    const value = part.slice(index + 1).trim();
+    if (key) out[key] = value;
+  }
+  return out;
+}
+
+function constantTimeEqual(a, b) {
+  const left = String(a ?? "");
+  const right = String(b ?? "");
+  if (left.length !== right.length) return false;
+  let diff = 0;
+  for (let i = 0; i < left.length; i += 1) diff |= left.charCodeAt(i) ^ right.charCodeAt(i);
+  return diff === 0;
+}
+
+function adminAuthorized(request, env) {
+  const token = String(env.ADMIN_TOKEN || "");
+  if (!token) return false;
+  const cookies = parseCookies(request.headers.get("Cookie") || "");
+  return constantTimeEqual(cookies.admin, token);
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +820,9 @@ export default {
         if (!user || !(await verifyPassword(password, user.password_hash))) {
           return json({ detail: "邮箱或密码不正确" }, 401);
         }
+        if (user.banned) {
+          return json({ detail: "该账号已被封禁" }, 403);
+        }
         const token = newToken();
         await env.DB.prepare(
           "INSERT INTO auth_tokens (user_id, token, created_at) VALUES (?, ?, ?)",
@@ -808,6 +841,56 @@ export default {
         const user = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(row.user_id).first();
         if (!user) return json({ detail: "用户不存在" }, 401);
         return json({ user: publicUser(user) });
+      }
+
+      if (method === "GET" && path === "/admin") {
+        return Response.redirect("/admin.html", 302);
+      }
+
+      if (method === "POST" && path === "/admin/login") {
+        const body = await request.json().catch(() => ({}));
+        const token = String(body.token || "");
+        if (!env.ADMIN_TOKEN || !constantTimeEqual(token, env.ADMIN_TOKEN)) {
+          return json({ ok: false, error: "令牌不正确" }, 401);
+        }
+        const cookie = `admin=${encodeURIComponent(env.ADMIN_TOKEN)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`;
+        return json({ ok: true }, 200, { "Set-Cookie": cookie });
+      }
+
+      if (method === "POST" && path === "/admin/logout") {
+        return json({ ok: true }, 200, { "Set-Cookie": "admin=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0" });
+      }
+
+      if (method === "GET" && path === "/admin/users") {
+        if (!adminAuthorized(request, env)) return json({ error: "未授权" }, 401);
+        const result = await env.DB.prepare(
+          "SELECT id, name, email, created_at, banned FROM users ORDER BY id DESC",
+        ).all();
+        return json({ users: result.results || [] });
+      }
+
+      if ((method === "DELETE" || method === "POST") && path.startsWith("/admin/users/")) {
+        if (!adminAuthorized(request, env)) return json({ error: "未授权" }, 401);
+        const parts = path.split("/");
+        const id = Number.parseInt(parts[3], 10);
+        const action = parts[4];
+        if (!id) return json({ error: "无效 ID" }, 400);
+
+        if (method === "DELETE") {
+          await env.DB.prepare("DELETE FROM auth_tokens WHERE user_id = ?").bind(id).run();
+          await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(id).run();
+          return json({ ok: true });
+        }
+        if (action === "ban") {
+          await env.DB.prepare("UPDATE users SET banned = 1 WHERE id = ?").bind(id).run();
+          await env.DB.prepare("DELETE FROM auth_tokens WHERE user_id = ?").bind(id).run();
+          return json({ ok: true });
+        }
+        if (action === "unban") {
+          await env.DB.prepare("UPDATE users SET banned = 0 WHERE id = ?").bind(id).run();
+          return json({ ok: true });
+        }
+        return json({ error: "未知操作" }, 400);
       }
     } catch (error) {
       console.error("Worker error:", error);
