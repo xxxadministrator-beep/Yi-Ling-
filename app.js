@@ -2,6 +2,7 @@
 
 const ICONS = {
   search: '<circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path>',
+  chat: '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"></path>',
   mic: '<path d="M12 2a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3Z"></path><path d="M19 10v1a7 7 0 0 1-14 0v-1"></path><path d="M12 18v4"></path>',
   scan: '<path d="M3 7V5a2 2 0 0 1 2-2h2"></path><path d="M17 3h2a2 2 0 0 1 2 2v2"></path><path d="M21 17v2a2 2 0 0 1-2 2h-2"></path><path d="M7 21H5a2 2 0 0 1-2-2v-2"></path><path d="M7 12h10"></path>',
   x: '<path d="M18 6 6 18"></path><path d="m6 6 12 12"></path>',
@@ -159,6 +160,7 @@ const TRANSLATE_CACHE = new Map();
 const DICT_CACHE = new Map();
 const ACCOUNTS_KEY = "yiling_accounts";
 const CURRENT_USER_KEY = "yiling_current_user";
+const TOKEN_KEY = "yiling_token";
 const API_BASE =
   window.YILING_API_BASE ||
   (window.location.protocol.startsWith("http") ? window.location.origin : "http://localhost:8000");
@@ -242,12 +244,45 @@ async function fetchBackendEntry(query) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ word: query }),
-    signal: AbortSignal.timeout(4000)
+    signal: AbortSignal.timeout(15000)
   });
   if (!res.ok) return null;
   const data = await res.json();
   if (!data || !data.senses || !data.senses.length) return null;
   return backendToEntry(data);
+}
+
+async function fetchBackendTranslate(text, src, tgt) {
+  const res = await fetch(`${API_BASE}/translate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, source_lang: src, target_lang: tgt }),
+    signal: AbortSignal.timeout(30000)
+  });
+  if (!res.ok) throw new Error(`bad status ${res.status}`);
+  const data = await res.json();
+  const translation = data && data.translation;
+  if (!translation) throw new Error("no translation");
+  return decodeHtml(translation);
+}
+
+// Resolve the English gloss for a Chinese word, most-trustworthy first. Reusing
+// the translation already shown for this exact source avoids re-hitting the
+// flaky MyMemory API, which can return pinyin fragments and mislead a Chinese
+// lookup into searching the wrong English word.
+async function translateZhToEn(text) {
+  if (state.currentSource === text && state.currentTranslation) {
+    return state.currentTranslation;
+  }
+  if (BACKEND_READY) {
+    try {
+      const result = await fetchBackendTranslate(text, "zh", "en");
+      if (result) return result;
+    } catch {
+      /* fall through to MyMemory */
+    }
+  }
+  return remoteTranslate(text, "zh", "en");
 }
 
 function toast(message) {
@@ -256,15 +291,6 @@ function toast(message) {
   el.classList.add("show");
   clearTimeout(el._timer);
   el._timer = setTimeout(() => el.classList.remove("show"), 2200);
-}
-
-function renderLangChips() {
-  const src = LANG_OPTIONS[state.sourceLang];
-  const tgt = LANG_OPTIONS[state.targetLang];
-  $("#sourceCode").textContent = src.code;
-  $("#sourceName").textContent = src.name;
-  $("#targetCode").textContent = tgt.code;
-  $("#targetName").textContent = tgt.name;
 }
 
 function setActiveTab(tab) {
@@ -284,6 +310,7 @@ function closeSheets() {
   $("#historySheet").hidden = true;
   $("#settingsSheet").hidden = true;
   $("#cameraModal").hidden = true;
+  $("#chatSheet").hidden = true;
 }
 
 function setHistoryTab(tab) {
@@ -300,27 +327,11 @@ function openHistorySheet() {
   openSheet("historySheet");
 }
 
-function openLangSheet(mode) {
-  state.langSheetMode = mode;
-  const title = $("#langSheetTitle");
-  title.textContent = mode === "source" ? "选择源语言" : "选择目标语言";
-  const current = mode === "source" ? state.sourceLang : state.targetLang;
-  const options = mode === "source" ? ["auto", "en", "zh"] : ["en", "zh"];
-  const list = $("#langList");
-  list.innerHTML = options
-    .map((key) => {
-      const opt = LANG_OPTIONS[key];
-      const selected = current === key ? " selected" : "";
-      return `<button class="lang-option${selected}" data-lang="${key}">
-        <span class="lang-code">${opt.code}</span>
-        <span class="option-name">${opt.name}</span>
-        <span class="option-sub">${opt.sub}</span>
-        <span class="check">${svg("check")}</span>
-      </button>`;
-    })
-    .join("");
-  hydrateIcons(list);
-  openSheet("langSheet");
+function openChatSheet() {
+  renderChatMessages();
+  updateParseButton();
+  openSheet("chatSheet");
+  setTimeout(() => $("#chatInput").focus(), 60);
 }
 
 function openSettings() {
@@ -402,7 +413,44 @@ function registerUser(name, email, password) {
   return "ok";
 }
 
-function handleAccountSubmit() {
+// Server-side account endpoints. When the backend is reachable, register/login
+// write to the users table (passwords stored as PBKDF2 hashes) instead of the
+// localStorage demo store.
+function authErrorDetail(data) {
+  const detail = data && data.detail;
+  if (!detail) return "";
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail) && detail.length) {
+    const first = detail[0];
+    if (first && typeof first === "object" && first.msg) return first.msg;
+    return String(detail[0]);
+  }
+  return "";
+}
+
+async function authRequest(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(10000)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const error = new Error(authErrorDetail(data) || "请求失败");
+    error.status = res.status;
+    throw error;
+  }
+  return data;
+}
+
+function storeSession(user, token) {
+  state.user = user;
+  localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(user));
+  if (token) localStorage.setItem(TOKEN_KEY, token);
+}
+
+async function handleAccountSubmit() {
   const email = $("#accountEmail").value.trim();
   const password = $("#accountPassword").value;
   const name = $("#accountName").value.trim();
@@ -414,7 +462,32 @@ function handleAccountSubmit() {
     toast("请输入昵称");
     return;
   }
+  if (state.accountMode === "register" && password.length < 6) {
+    toast("密码至少 6 位");
+    return;
+  }
 
+  if (BACKEND_READY) {
+    try {
+      const data =
+        state.accountMode === "register"
+          ? await authRequest("/auth/register", { name, email, password })
+          : await authRequest("/auth/login", { email, password });
+      storeSession(data.user, data.token);
+      loadStore();
+      renderHistory();
+      renderSaved();
+      renderAccountUI();
+      toast(state.accountMode === "register" ? "注册成功" : "登录成功");
+      closeSheets();
+      return;
+    } catch (error) {
+      toast(error.message || (state.accountMode === "register" ? "注册失败" : "登录失败"));
+      return;
+    }
+  }
+
+  // Offline fallback: local accounts in localStorage.
   let ok = false;
   if (state.accountMode === "register") {
     const result = registerUser(name, email, password);
@@ -442,6 +515,7 @@ function handleAccountSubmit() {
 function logoutUser() {
   state.user = null;
   localStorage.removeItem(CURRENT_USER_KEY);
+  localStorage.removeItem(TOKEN_KEY);
   loadStore();
   renderHistory();
   renderSaved();
@@ -466,10 +540,14 @@ function openFilePicker(capture) {
   input.click();
 }
 
-function showResult(mainHtml, altHtml) {
+function showResult(mainHtml, altHtml, multiHtml) {
   const el = $("#resultContent");
   let html = `<p class="translated-main">${mainHtml}</p>`;
-  if (altHtml) html += `<p class="translated-alt">${altHtml}</p>`;
+  if (multiHtml) {
+    html += multiHtml;
+  } else if (altHtml) {
+    html += `<p class="translated-alt">${altHtml}</p>`;
+  }
   el.innerHTML = html;
   $("#resultActions").hidden = false;
 }
@@ -477,8 +555,6 @@ function showResult(mainHtml, altHtml) {
 function clearResult() {
   $("#resultContent").innerHTML = `<p class="result-placeholder">译文将显示在这里</p>`;
   $("#resultActions").hidden = true;
-  $("#aiSection").hidden = true;
-  $("#aiContent").innerHTML = "";
   $("#dictPanel").hidden = true;
   state.currentTranslation = "";
   state.currentSource = "";
@@ -489,8 +565,6 @@ function clearResult() {
 function setLoading() {
   $("#resultContent").innerHTML = `<p class="result-placeholder">正在翻译<span class="loading-dots"></span></p>`;
   $("#resultActions").hidden = true;
-  $("#aiSection").hidden = true;
-  $("#aiContent").innerHTML = "";
   $("#dictPanel").hidden = true;
 }
 
@@ -506,17 +580,63 @@ function shouldAutoDict(text, src) {
 function remoteTranslate(text, src, tgt) {
   const from = src === "zh" ? "zh-CN" : "en";
   const to = tgt === "zh" ? "zh-CN" : "en";
-  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${from}|${to}`;
-  return fetch(url, { signal: AbortSignal.timeout(5000) })
-    .then((res) => {
-      if (!res.ok) throw new Error("bad status");
-      return res.json();
-    })
-    .then((data) => {
-      const translated = data && data.responseData && data.responseData.translatedText;
-      if (!translated || /MYMEMORY WARNING/i.test(translated)) throw new Error("no result");
-      return decodeHtml(translated);
-    });
+  // MyMemory caps a request at 500 chars and replies with an error string
+  // instead of a translation, so long text is split into line-aware chunks.
+  const chunks = splitForTranslation(text);
+  const requests = chunks.map((chunk) =>
+    fetch(
+      `https://api.mymemory.translated.net/get?q=${encodeURIComponent(chunk)}&langpair=${from}|${to}`,
+      { signal: AbortSignal.timeout(8000) }
+    )
+      .then((res) => {
+        if (!res.ok) throw new Error("bad status");
+        return res.json();
+      })
+      .then((data) => {
+        const translated = data && data.responseData && data.responseData.translatedText;
+        if (!translated || /MYMEMORY WARNING|QUERY LENGTH LIMIT|INVALID SOURCE|NO QUERY/i.test(translated)) {
+          throw new Error("no result");
+        }
+        return decodeHtml(translated);
+      })
+  );
+  // A failed chunk is dropped instead of failing the whole document, so a
+  // partial translation is still returned.
+  return Promise.allSettled(requests).then((results) => {
+    const parts = results
+      .filter((item) => item.status === "fulfilled" && item.value)
+      .map((item) => item.value);
+    const joined = parts.join("\n").trim();
+    if (!joined) throw new Error("no result");
+    return joined;
+  });
+}
+
+function splitForTranslation(text, max = 450) {
+  const trimmed = String(text || "").trim();
+  if (trimmed.length <= max) return [trimmed];
+
+  const chunks = [];
+  for (const line of trimmed.split("\n")) {
+    let rest = line.trim();
+    if (!rest) continue;
+    while (rest.length > max) {
+      let cut = rest.slice(0, max);
+      const breakAt = Math.max(
+        cut.lastIndexOf(". "),
+        cut.lastIndexOf("。"),
+        cut.lastIndexOf("；"),
+        cut.lastIndexOf("; "),
+        cut.lastIndexOf("! "),
+        cut.lastIndexOf("? ")
+      );
+      if (breakAt > max * 0.5) cut = rest.slice(0, breakAt + 1);
+      chunks.push(cut.trim());
+      rest = rest.slice(cut.length).trim();
+    }
+    if (rest) chunks.push(rest);
+  }
+  return chunks.filter(Boolean);
 }
 
 function localTranslate(text, src, tgt) {
@@ -539,6 +659,69 @@ function localTranslate(text, src, tgt) {
   }
 
   return clean;
+}
+
+// Curated 中文 -> 英文 一词多译 groups. Each English headword is followed by
+// its Chinese glosses, so 查词 shows "promote 促进，提倡；升职，晋升…" style
+// lines instead of a flat word list. Words absent here fall back to the
+// auto-derived groups below.
+const ZH_MULTI = {
+  "促进": [
+    { en: "promote", zh: "促进，提倡；升职，晋升；促销，推广；将（运动）" },
+    { en: "accelerate", zh: "（使）加快，促进；（车辆或驾驶者）加速" },
+    { en: "facilitate", zh: "使更容易，使便利；促进，推动" }
+  ]
+};
+
+// Grouped 中文 -> 英文 translations, each as { en, zh }. The curated ZH_MULTI
+// table wins; otherwise a Chinese lexicon entry's English glosses become the
+// headwords, and each headword's Chinese meaning is pulled from the English
+// lexicon when available (otherwise the source word itself).
+function zhAlternativeGroups(text) {
+  const clean = text.trim();
+  if (ZH_MULTI[clean]) return ZH_MULTI[clean];
+  const entry = ZH_LEXICON[clean];
+  if (!entry || !entry.en) return null;
+  const words = entry.en.split(/[;；]/).map((s) => s.trim()).filter(Boolean);
+  if (words.length < 2) return null;
+  return words.map((w) => {
+    const key = normalizeWord(w);
+    const gloss = LEXICON[key] ? LEXICON[key].zh : clean;
+    return { en: w, zh: gloss };
+  });
+}
+
+// Flat list of Chinese glosses for an English word's 一词多译 block.
+function enAlternativeTranslations(text) {
+  const entry = LEXICON[normalizeWord(text.trim())];
+  if (!entry || !entry.zh) return null;
+  const list = entry.zh.split(/[；;]/).map((s) => s.trim()).filter(Boolean);
+  return list.length > 1 ? list : null;
+}
+
+function multiItemsHtml(groups) {
+  return groups
+    .map(
+      (g) =>
+        `<div class="multi-item"><span class="multi-en">${escapeHtml(g.en)}</span><span class="multi-zh">${escapeHtml(g.zh)}</span></div>`
+    )
+    .join("");
+}
+
+function groupedMultiHtml(groups) {
+  if (!groups || !groups.length) return "";
+  return `<div class="result-multi"><div class="result-multi-title">一词多译</div><div class="multi-list">${multiItemsHtml(groups)}</div></div>`;
+}
+
+function flatMultiHtml(items) {
+  if (!items || items.length < 2) return "";
+  const list = items
+    .map(
+      (text, index) =>
+        `<div class="trans-item"><span class="trans-num">${index + 1}</span><span class="trans-text">${escapeHtml(text)}</span></div>`
+    )
+    .join("");
+  return `<div class="result-multi"><div class="result-multi-title">一词多译</div><div class="trans-list">${list}</div></div>`;
 }
 
 function buildTokens(text, src, tgt) {
@@ -585,45 +768,56 @@ function findTip(text, src) {
   return "演示模式采用本地语料生成解析；接入 DeepSeek 后可持续补充语境与地道表达。";
 }
 
-function renderInsights(text, src, tgt, translated) {
-  const section = $("#aiSection");
-  const content = $("#aiContent");
+async function fetchChat(messages, timeout) {
+  const res = await fetch(`${API_BASE}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages }),
+    signal: AbortSignal.timeout(timeout || 30000)
+  });
+  if (!res.ok) throw new Error(`bad status ${res.status}`);
+  const data = await res.json();
+  return data && data.reply ? String(data.reply).trim() : "";
+}
+
+function buildInsightPrompt(text, src, tgt, translated) {
+  const from = src === "zh" ? "中文" : "英语";
+  const to = tgt === "zh" ? "中文" : "英语";
+  return [
+    `请分析这段${from}文本，并把它翻译成${to}。`,
+    `原文：${text}`,
+    translated ? `参考译文：${translated}` : "",
+    "请分三部分输出，每部分 2-3 句，使用简体中文：",
+    "1. 逐词解析：关键词语的词性、含义与常见搭配；",
+    "2. 地道表达：更自然的说法或语气差异；",
+    "3. 替代译法：1-2 个可选译文。"
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+// Plain-text version of the local parse, shown in the AI 对话 sheet when the
+// user manually asks to parse the current translation while the backend is
+// offline. The online path sends the fuller prompt below to DeepSeek instead.
+function localInsightText(text, src, tgt) {
   const tokens = buildTokens(text, src, tgt);
-  const knownTokens = tokens.filter((t) => t.tgt);
+  const known = tokens.filter((t) => t.tgt);
+  const lines = [];
+  lines.push(
+    known.length
+      ? "逐词解析：" + tokens.map((t) => (t.tgt ? `${t.src}（${t.tgt}）` : t.src)).join("、")
+      : `逐词解析：语料未覆盖“${text}”`
+  );
+  lines.push("地道表达：" + findTip(text, src));
 
-  let tokenHtml = `<div class="ai-card">
-    <div class="ai-card-head"><span class="inline-ic">${svg("sparkles")}</span><h3>逐词解析</h3></div>
-    <div class="token-list">`;
-  if (knownTokens.length) {
-    tokenHtml += tokens
-      .map((t) => (t.tgt ? `<span class="token"><b>${escapeHtml(t.src)}</b><span>${escapeHtml(t.tgt)}</span></span>` : `<span class="token unknown"><b>${escapeHtml(t.src)}</b></span>`))
-      .join("");
-  } else {
-    tokenHtml += `<span class="token unknown"><b>${escapeHtml(text)}</b><span>语料未覆盖</span></span>`;
+  let alternative = "";
+  if (src === "en" && PHRASES[text.toLowerCase()]) alternative = PHRASES[text.toLowerCase()].alt;
+  else if (src === "zh" && PHRASES[text]) alternative = PHRASES[text].alt;
+  else if (src === "en" && LEXICON[normalizeWord(text.trim())]) {
+    alternative = LEXICON[normalizeWord(text.trim())].synonyms.slice(0, 3).join("、");
   }
-  tokenHtml += `</div></div>`;
-
-  const tip = findTip(text, src);
-  const tipHtml = `<div class="ai-card">
-    <div class="ai-card-head"><span class="inline-ic">${svg("book")}</span><h3>地道表达</h3></div>
-    <p class="tip-copy">${tip}</p>
-  </div>`;
-
-  let alt = "";
-  if (src === "en" && PHRASES[text.toLowerCase()]) alt = PHRASES[text.toLowerCase()].alt;
-  else if (src === "zh" && PHRASES[text]) alt = PHRASES[text].alt;
-  else if (src === "en" && LEXICON[normalizeWord(text.trim())]) alt = LEXICON[normalizeWord(text.trim())].synonyms.slice(0, 3).join("、");
-
-  let altHtml = "";
-  if (alt) {
-    altHtml = `<div class="ai-card">
-      <div class="ai-card-head"><span class="inline-ic">${svg("swap")}</span><h3>替代译法</h3></div>
-      <p class="alt-copy">也可以说：<strong>${alt}</strong></p>
-    </div>`;
-  }
-
-  content.innerHTML = tokenHtml + tipHtml + altHtml;
-  section.hidden = false;
+  if (alternative) lines.push("替代译法：" + alternative);
+  return lines.join("\n");
 }
 
 async function doTranslate(text) {
@@ -642,18 +836,39 @@ async function doTranslate(text) {
 
   let translated = "";
   let usedLocal = false;
-  if (TRANSLATE_CACHE.has(cacheKey)) {
+  let multiHtml = "";
+
+  // 中文 -> 英文 with known equivalents resolves locally (no network), which
+  // both speeds it up and keeps the grouped 一词多译 list authoritative.
+  const zhGroups = src === "zh" && tgt === "en" ? zhAlternativeGroups(safeText) : null;
+  if (zhGroups) {
+    translated = zhGroups[0].en;
+    usedLocal = true;
+    multiHtml = groupedMultiHtml(zhGroups);
+  } else if (TRANSLATE_CACHE.has(cacheKey)) {
     translated = TRANSLATE_CACHE.get(cacheKey);
     usedLocal = true;
   } else {
     translated = localTranslate(safeText, src, tgt);
     usedLocal = !!translated;
     if (!translated) {
-      try {
-        translated = await remoteTranslate(safeText, src, tgt);
-        usedLocal = false;
-      } catch {
-        translated = "";
+      // DeepSeek first when the backend is up: it handles long documents and
+      // has no 500-char cap. MyMemory is the offline fallback.
+      if (BACKEND_READY) {
+        try {
+          translated = await fetchBackendTranslate(safeText, src, tgt);
+          usedLocal = false;
+        } catch {
+          translated = "";
+        }
+      }
+      if (!translated) {
+        try {
+          translated = await remoteTranslate(safeText, src, tgt);
+          usedLocal = false;
+        } catch {
+          translated = "";
+        }
       }
     }
     if (translated) {
@@ -664,17 +879,19 @@ async function doTranslate(text) {
     }
   }
 
+  if (src === "en" && tgt === "zh") {
+    multiHtml = flatMultiHtml(enAlternativeTranslations(safeText));
+  }
+
   if (!translated) {
     $("#resultContent").innerHTML = `<p class="result-placeholder">当前为离线演示模式，尚未覆盖该内容。联网后可使用完整 AI 翻译。</p>`;
     $("#resultActions").hidden = true;
-    $("#aiSection").hidden = true;
     $("#dictPanel").hidden = true;
     state.currentTranslation = "";
     return;
   }
 
-  showResult(escapeHtml(translated), usedLocal ? "本地 / 离线译文" : "");
-  renderInsights(safeText, src, tgt, translated);
+  showResult(escapeHtml(translated), usedLocal ? "本地 / 离线译文" : "", multiHtml);
   state.currentTranslation = translated;
   state.currentSaved = isSaved(safeText, translated);
   updateSaveButton();
@@ -845,44 +1062,89 @@ function speak(text, lang) {
   window.speechSynthesis.speak(utter);
 }
 
+function speechErrorMessage(code) {
+  const map = {
+    "no-speech": "没有听到声音，请靠近麦克风重试",
+    "not-allowed": "麦克风权限被拒绝：请在浏览器地址栏允许麦克风，或通过 localhost 打开本页",
+    NotAllowedError: "麦克风权限被拒绝：请在浏览器地址栏允许麦克风，或通过 localhost 打开本页",
+    "service-not-allowed": "当前环境不允许语音识别，请改用 Chrome 或 Edge 浏览器",
+    network: "无法连接语音识别服务器：Chrome 依赖 Google 服务，若无法访问请改用 Edge 浏览器",
+    aborted: "语音识别已取消",
+    "audio-capture": "未检测到可用麦克风",
+    "language-not-supported": "当前语言暂不支持语音识别"
+  };
+  return map[code] || (code ? `语音识别失败：${code}` : "语音识别失败，请重试");
+}
+
 function startListening(lang) {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) {
-    toast("当前浏览器不支持语音输入");
+    toast("当前浏览器不支持语音输入，请使用 Chrome 或 Edge");
     return;
   }
   const rec = new SR();
   rec.lang = lang === "zh" ? "zh-CN" : "en-US";
   rec.interimResults = false;
   rec.maxAlternatives = 1;
+  rec.continuous = false;
+  rec.onstart = () => toast("正在聆听，请说话…");
   rec.onresult = (event) => {
     const text = event.results[0][0].transcript;
     $("#sourceInput").value = text;
+    $("#charCount").textContent = `${text.length} / 5000`;
     scheduleTranslate();
   };
-  rec.onerror = () => toast("未能识别语音，请重试");
+  rec.onerror = (event) => toast(speechErrorMessage(event && event.error));
   rec.onend = () => {};
-  rec.start();
+  try {
+    rec.start();
+  } catch (error) {
+    toast(speechErrorMessage(error && error.name));
+  }
 }
 
-function loadTesseract() {
+const TESSERACT_CDNS = [
+  "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js",
+  "https://unpkg.com/tesseract.js@5/dist/tesseract.min.js"
+];
+// tesseract.js downloads language data from tessdata.projectnaptha.com by
+// default, which is frequently unreachable; the jsdelivr mirror is more
+// reliable and hosts both English and Simplified Chinese packs.
+const TESSDATA_LANG_PATH = "https://cdn.jsdelivr.net/gh/naptha/tessdata@gh-pages/4.0.0";
+
+function loadScript(src) {
   return new Promise((resolve, reject) => {
-    if (window.Tesseract) return resolve(window.Tesseract);
     const script = document.createElement("script");
-    script.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
-    script.onload = () => resolve(window.Tesseract);
-    script.onerror = () => reject(new Error("load failed"));
+    script.src = src;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("加载失败：" + src));
     document.head.appendChild(script);
   });
+}
+
+async function loadTesseract() {
+  if (window.Tesseract) return window.Tesseract;
+  let lastError = null;
+  for (const url of TESSERACT_CDNS) {
+    try {
+      await loadScript(url);
+      if (window.Tesseract) return window.Tesseract;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("OCR 引擎加载失败");
 }
 
 async function runOcr(file) {
   const status = $("#ocrStatus");
   status.classList.remove("error");
-  status.textContent = "正在识别文字，请稍候...";
+  status.textContent = "正在加载识别引擎，请稍候…";
   try {
     const Tesseract = await loadTesseract();
-    const { data } = await Tesseract.recognize(file, "eng", {
+    status.textContent = "引擎就绪，正在识别中英文文字…";
+    const { data } = await Tesseract.recognize(file, "chi_sim+eng", {
+      langPath: TESSDATA_LANG_PATH,
       logger: (m) => {
         if (m.status === "recognizing text") {
           status.textContent = `识别中 ${Math.round(m.progress * 100)}%`;
@@ -892,7 +1154,7 @@ async function runOcr(file) {
     const text = (data.text || "").trim();
     if (!text) {
       status.classList.add("error");
-      status.textContent = "未识别到英文文字，请换一张更清晰的图片";
+      status.textContent = "未识别到文字，请换一张更清晰的图片";
       return;
     }
     status.textContent = "识别完成";
@@ -903,52 +1165,124 @@ async function runOcr(file) {
     doTranslate(text);
   } catch {
     status.classList.add("error");
-    status.textContent = "OCR 引擎加载失败，可先使用文字输入";
+    status.textContent = "OCR 识别失败：请检查网络后重试（首次识别需下载语言数据）";
   }
 }
 
+// Canonical part-of-speech model, mirroring backend/app/pos.py. WordNet sends
+// n/v/a/s/r, Wiktionary sends "Noun"/"Preposition", Datamuse sends
+// n/v/adj/adv/prop and dictionaryapi.dev sends lowercase names. Everything is
+// normalized before display, otherwise every capitalized value collapses into
+// "其他" and the part-of-speech tabs look incomplete.
+const POS_ORDER = [
+  "noun", "proper noun", "pronoun", "verb", "auxiliary verb", "adjective",
+  "adverb", "numeral", "determiner", "article", "preposition", "postposition",
+  "conjunction", "particle", "interjection", "phrase", "idiom", "abbreviation",
+  "contraction", "prefix", "suffix", "symbol", "letter", "other"
+];
+
 const POS_LABELS = {
   noun: { short: "n.", label: "名词" },
+  "proper noun": { short: "prop.", label: "专有名词" },
+  pronoun: { short: "pron.", label: "代词" },
   verb: { short: "v.", label: "动词" },
+  "auxiliary verb": { short: "aux.", label: "助动词" },
   adjective: { short: "adj.", label: "形容词" },
   adverb: { short: "adv.", label: "副词" },
-  pronoun: { short: "pron.", label: "代词" },
-  preposition: { short: "prep.", label: "介词" },
-  adposition: { short: "prep.", label: "介词" },
-  conjunction: { short: "conj.", label: "连词" },
-  interjection: { short: "int.", label: "感叹词" },
-  exclamation: { short: "int.", label: "感叹词" },
-  determiner: { short: "det.", label: "限定词" },
   numeral: { short: "num.", label: "数词" },
+  determiner: { short: "det.", label: "限定词" },
+  article: { short: "art.", label: "冠词" },
+  preposition: { short: "prep.", label: "介词" },
+  postposition: { short: "postp.", label: "后置词" },
+  conjunction: { short: "conj.", label: "连词" },
   particle: { short: "part.", label: "助词" },
+  interjection: { short: "int.", label: "感叹词" },
   phrase: { short: "phr.", label: "短语" },
-  abbreviation: { short: "abbr.", label: "缩略词" },
+  idiom: { short: "idiom", label: "习语" },
+  abbreviation: { short: "abbr.", label: "缩写" },
+  contraction: { short: "contr.", label: "缩合形式" },
+  prefix: { short: "pref.", label: "前缀" },
+  suffix: { short: "suf.", label: "后缀" },
+  symbol: { short: "sym.", label: "符号" },
+  letter: { short: "letter", label: "字母" },
   other: { short: "", label: "其他" }
 };
 
+const POS_ALIASES = {
+  n: "noun", "n.": "noun", noun: "noun", "common noun": "noun", "count noun": "noun", "mass noun": "noun", "名词": "noun",
+  prop: "proper noun", "prop.": "proper noun", "proper noun": "proper noun", "proper-noun": "proper noun", "proper name": "proper noun", name: "proper noun", "专有名词": "proper noun",
+  pron: "pronoun", "pron.": "pronoun", pronoun: "pronoun", "personal pronoun": "pronoun", "relative pronoun": "pronoun", "代词": "pronoun",
+  v: "verb", "v.": "verb", verb: "verb", "intransitive verb": "verb", "transitive verb": "verb", "动词": "verb",
+  aux: "auxiliary verb", "aux.": "auxiliary verb", auxiliary: "auxiliary verb", modal: "auxiliary verb", "modal verb": "auxiliary verb", "助动词": "auxiliary verb",
+  a: "adjective", "a.": "adjective", s: "adjective", adj: "adjective", "adj.": "adjective", adjective: "adjective", adjectival: "adjective", "形容词": "adjective",
+  r: "adverb", adv: "adverb", "adv.": "adverb", adverb: "adverb", adverbial: "adverb", "副词": "adverb",
+  num: "numeral", "num.": "numeral", numeral: "numeral", number: "numeral", "cardinal number": "numeral", "ordinal number": "numeral", "数词": "numeral",
+  det: "determiner", "det.": "determiner", determiner: "determiner", determinative: "determiner", quantifier: "determiner", "限定词": "determiner",
+  art: "article", "art.": "article", article: "article", "definite article": "article", "indefinite article": "article", "冠词": "article",
+  prep: "preposition", "prep.": "preposition", preposition: "preposition", prepositional: "preposition", adposition: "preposition", "介词": "preposition",
+  postp: "postposition", "postp.": "postposition", postposition: "postposition", "后置词": "postposition",
+  conj: "conjunction", "conj.": "conjunction", conjunction: "conjunction", "连词": "conjunction",
+  part: "particle", "part.": "particle", particle: "particle", "助词": "particle",
+  int: "interjection", "int.": "interjection", interj: "interjection", "interj.": "interjection", interjection: "interjection", exclamation: "interjection", "感叹词": "interjection",
+  phr: "phrase", "phr.": "phrase", phrase: "phrase", phrasal: "phrase", "noun phrase": "phrase", "verb phrase": "phrase", expression: "phrase", proverb: "phrase", "短语": "phrase",
+  idiom: "idiom", "习语": "idiom",
+  abbr: "abbreviation", "abbr.": "abbreviation", abbreviation: "abbreviation", initialism: "abbreviation", acronym: "abbreviation", "缩写": "abbreviation",
+  contraction: "contraction", "contraction form": "contraction", "缩合形式": "contraction",
+  pref: "prefix", "pref.": "prefix", prefix: "prefix", "前缀": "prefix",
+  suf: "suffix", "suf.": "suffix", suffix: "suffix", "后缀": "suffix",
+  sym: "symbol", "sym.": "symbol", symbol: "symbol", sign: "symbol", "符号": "symbol",
+  letter: "letter", character: "letter", "字母": "letter",
+  u: "other", other: "other", unknown: "other", undefined: "other",
+  // Kept in step with backend/app/pos.py; a cross-language parity check fails
+  // whenever the two alias tables drift apart.
+  "": "other",
+  "auxiliary verb": "auxiliary verb",
+  demonstrative: "pronoun",
+  "helping verb": "auxiliary verb",
+  postpositional: "preposition",
+  propername: "proper noun"
+};
+
+function normalizePos(raw) {
+  const cleaned = String(raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\/\\,，;；、·|]/g, " ")
+    .replace(/[()_\-]/g, " ")
+    .replace(/\s+/g, " ");
+  if (!cleaned) return "other";
+  if (POS_ALIASES[cleaned]) return POS_ALIASES[cleaned];
+  if (POS_ALIASES[cleaned + "."]) return POS_ALIASES[cleaned + "."];
+  for (const word of cleaned.split(" ")) {
+    const target = POS_ALIASES[word];
+    if (target && target !== "other") return target;
+  }
+  return "other";
+}
+
 function posInfo(pos) {
-  return POS_LABELS[pos] || POS_LABELS.other;
+  return POS_LABELS[normalizePos(pos)] || POS_LABELS.other;
+}
+
+function posRank(pos) {
+  const index = POS_ORDER.indexOf(normalizePos(pos));
+  return index < 0 ? POS_ORDER.length : index;
+}
+
+function splitPosString(raw) {
+  const parts = String(raw || "").replace(/[\/\\,，;；、·|]/g, " ").split(/\s+/).filter(Boolean);
+  const found = [];
+  for (const part of parts) {
+    const name = normalizePos(part);
+    if (!found.includes(name)) found.push(name);
+  }
+  const meaningful = found.filter((name) => name !== "other");
+  if (meaningful.length) return meaningful;
+  return found.length ? found : ["other"];
 }
 
 function parseLocalPos(posString) {
-  const map = {
-    "n": "noun", "n.": "noun",
-    "v": "verb", "v.": "verb",
-    "adj": "adjective", "adj.": "adjective",
-    "adv": "adverb", "adv.": "adverb",
-    "prep": "preposition", "prep.": "preposition",
-    "conj": "conjunction", "conj.": "conjunction",
-    "pron": "pronoun", "pron.": "pronoun",
-    "int": "interjection", "int.": "interjection",
-    "det": "determiner", "det.": "determiner",
-    "num": "numeral", "num.": "numeral",
-    "part": "particle", "part.": "particle",
-    "phr": "phrase", "phr.": "phrase"
-  };
-  return String(posString || "")
-    .split(/[\/,，]/)
-    .map((s) => map[s.trim().toLowerCase()] || "other")
-    .filter((p, index, arr) => p !== "other" || arr.length === 1);
+  return splitPosString(posString);
 }
 
 function normalizeSenses(entry) {
@@ -990,16 +1324,28 @@ function phoneticLine(entry, query) {
   return `<div class="phonetic-line">${chunks.join("")}<button class="mini-btn speak-word" data-text="${escapeHtml(query)}" aria-label="朗读">${svg("volume-2")}</button></div>`;
 }
 
-function senseBlock(sense) {
+function senseBlock(sense, lang) {
   const info = posInfo(sense.pos);
   const defs = sense.defs
     .map((d, index) => {
       const example = d.ex
         ? `<p class="def-ex">${escapeHtml(d.ex)}${d.exZh ? ` <span>${escapeHtml(d.exZh)}</span>` : ""}<button class="mini-btn speak-example" data-text="${escapeHtml(d.ex)}" aria-label="朗读">${svg("volume-2")}</button></p>`
         : "";
-      const zh = d.zh ? `<p class="def-zh">${escapeHtml(d.zh)}</p>` : "";
+      // Chinese-first for English words, English-first for Chinese words.
+      const en = d.en || "";
+      const zh = d.zh || "";
+      let primary, secondary;
+      if (lang === "en") {
+        primary = zh || en;
+        secondary = zh ? en : "";
+      } else {
+        primary = en || zh;
+        secondary = en ? zh : "";
+      }
+      const primaryHtml = primary ? `<p class="def-primary">${escapeHtml(primary)}</p>` : "";
+      const secondaryHtml = secondary ? `<p class="def-secondary">${escapeHtml(secondary)}</p>` : "";
       return `<li class="def-item">
-        <div class="def-main"><span class="def-num">${index + 1}.</span><div class="def-text"><p class="def-en">${escapeHtml(d.en)}</p>${zh}</div></div>
+        <div class="def-main"><span class="def-num">${index + 1}.</span><div class="def-text">${primaryHtml}${secondaryHtml}</div></div>
         ${example}
       </li>`;
     })
@@ -1053,11 +1399,12 @@ function sourceLine(entry) {
 function renderDictionaryEntry(entry, query) {
   const container = $("#dictResult");
   const senses = normalizeSenses(entry);
+  const lang = detectLang(query);
   const posList = [...new Set(senses.map((s) => s.pos))];
   state.dictActivePos = "all";
   state.dictEntry = entry;
   state.dictQuery = query;
-  DICT_CACHE.set(`${detectLang(query)}|${String(query).toLowerCase()}`, entry);
+  DICT_CACHE.set(`${lang}|${String(query).toLowerCase()}`, entry);
   if (DICT_CACHE.size > 200) DICT_CACHE.delete(DICT_CACHE.keys().next().value);
   $("#dictPanel").hidden = false;
 
@@ -1069,9 +1416,12 @@ function renderDictionaryEntry(entry, query) {
   const saved = isSaved(query, gloss);
   const pinyin = entry.pinyin ? `<p class="dict-pinyin">拼音：${escapeHtml(entry.pinyin)}</p>` : "";
   const translations = entry.translations || [];
-  const hasMulti = translations.length >= 2;
+  const zhGroups = lang === "zh" ? zhAlternativeGroups(query) : null;
+  const hasMulti = (zhGroups && zhGroups.length) || translations.length >= 2;
   const zhLine = hasMulti ? "" : entry.zh ? `<p class="dict-zh">${escapeHtml(entry.zh)}</p>` : "";
-  const transHtml = buildTranslations(translations);
+  const transHtml = zhGroups
+    ? `<div class="dict-trans"><h3>一词多译</h3><div class="multi-list">${multiItemsHtml(zhGroups)}</div></div>`
+    : buildTranslations(translations);
 
   container.innerHTML = `<article class="dict-card">
     <div class="dict-top">
@@ -1085,7 +1435,7 @@ function renderDictionaryEntry(entry, query) {
       ${pinyin}
     </div>
     <div class="pos-tabs">${tabs}</div>
-    <div class="sense-list">${senses.map(senseBlock).join("")}</div>
+    <div class="sense-list">${senses.map((sense) => senseBlock(sense, lang)).join("")}</div>
     ${buildExamples(entry)}
     ${buildRelations(entry)}
     ${sourceLine(entry)}
@@ -1120,6 +1470,26 @@ function emptyDictResult(message, query) {
   $("#dictPanel").hidden = false;
 }
 
+let dictRequest = 0;
+
+function buildZhLocalEntry(query, local) {
+  return {
+    word: query,
+    pinyin: local.pinyin || "",
+    zh: local.en,
+    shortGloss: (local.en || "").split(";")[0].trim(),
+    translations: (local.en || "").split(/[;；]/).map((s) => s.trim()).filter(Boolean),
+    senses: parseLocalPos(local.pos).map((pos) => ({
+      pos,
+      label: posInfo(pos).label,
+      short: posInfo(pos).short,
+      defs: [{ en: local.en, zh: "" }]
+    })),
+    examples: local.examples || [],
+    source: "内置词库"
+  };
+}
+
 async function lookupDictionary(query, options = {}) {
   query = (query == null ? $("#sourceInput").value : query).trim();
   if (!query) {
@@ -1138,58 +1508,66 @@ async function lookupDictionary(query, options = {}) {
     return;
   }
   state.dictQuery = query;
+  const requestId = ++dictRequest;
+  const dictStale = () => requestId !== dictRequest;
 
-  if (BACKEND_READY) {
-    const backendEntry = await fetchBackendEntry(query).catch(() => null);
-    if (backendEntry) {
-      renderDictionaryEntry(backendEntry, query);
-      return;
-    }
-  }
-
+  // Render a known word instantly so the first paint never waits on the
+  // network; the backend and browser sources enrich it in the background.
   if (lang === "zh") {
     const local = ZH_LEXICON[query];
     if (local) {
-      renderDictionaryEntry({
-        word: query,
-        pinyin: local.pinyin || "",
-        zh: local.en,
-        shortGloss: (local.en || "").split(";")[0].trim(),
-        translations: (local.en || "").split(/[;；]/).map((s) => s.trim()).filter(Boolean),
-        senses: parseLocalPos(local.pos).map((pos) => ({ pos, label: posInfo(pos).label, defs: [{ en: local.en, zh: "" }] })),
-        examples: local.examples || [],
-        source: "CC-CEDICT"
-      }, query);
+      renderDictionaryEntry(buildZhLocalEntry(query, local), query);
     } else {
-      $("#dictPanel").hidden = false;
-      $("#dictResult").innerHTML = `<div class="empty-state"><p class="result-placeholder">正在查询<span class="loading-dots"></span></p></div>`;
+      showDictLoading();
     }
 
-    const english = local ? (local.en || "").split(";")[0].trim() : await remoteTranslate(query, "zh", "en").catch(() => "");
+    // Curated local entries for common Chinese words beat the backend's DeepSeek
+    // zh->en guess, which can pick the wrong homograph (苹果 -> the Apple brand).
+    // Words the local lexicon doesn't know still go through the backend.
+    if (!local && BACKEND_READY) {
+      const backendEntry = await fetchBackendEntry(query).catch(() => null);
+      if (dictStale()) return;
+      if (backendEntry && backendEntry.senses.length) {
+        renderDictionaryEntry(backendEntry, query);
+        return;
+      }
+    }
+
+    // No reachable source describes Chinese parts of speech (CC-CEDICT stores
+    // none, and the Wiktionary REST endpoint usually omits the Chinese
+    // section), so the English gloss of the word supplies them instead.
+    const english = local
+      ? (local.en || "").split(/[;；]/)[0].trim()
+      : await translateZhToEn(query).catch(() => "");
+    if (dictStale()) return;
     if (!english) {
-      emptyDictResult(`未找到 “${escapeHtml(query)}”，请检查拼写或联网重试`, query);
+      if (!local) emptyDictResult(`未找到 “${escapeHtml(query)}”，请检查拼写或联网重试`, query);
       return;
     }
-    let remote = null;
-    try {
-      remote = await fetchEnglishEntry(english);
-    } catch {
-      remote = null;
-    }
-    if (remote) {
-      const senses = remote.senses.map((s) => ({ pos: s.pos, label: s.label, defs: s.defs.map((d) => ({ en: d.en, zh: local ? local.en : "", ex: d.ex, exZh: "" })) }));
+    const glossWord = normalizeWord(english.split(/\s+/)[0] || english);
+    const remote = glossWord ? await fetchMergedEntry(glossWord).catch(() => null) : null;
+    if (dictStale()) return;
+
+    if (remote && remote.senses.length) {
       renderDictionaryEntry({
         word: query,
         pinyin: local ? local.pinyin : "",
+        phoneticUK: "",
+        phoneticUS: "",
         zh: local ? local.en : `英文释义：${english}`,
         shortGloss: english,
         translations: local ? (local.en || "").split(/[;；]/).map((s) => s.trim()).filter(Boolean) : [english],
-        senses,
+        senses: remote.senses.map((sense) => ({
+          pos: sense.pos,
+          label: sense.label,
+          short: sense.short,
+          defs: sense.defs.map((d) => ({ en: d.en, zh: local ? local.en : "", ex: d.ex, exZh: "" }))
+        })),
         synonyms: remote.synonyms,
         antonyms: remote.antonyms,
         forms: remote.forms,
         examples: local ? local.examples : [],
-        source: local ? "CC-CEDICT · WordNet" : "机器翻译 · WordNet"
+        source: `${remote.source} · 由英文释义「${english}」推出词性`
       }, query);
     } else if (!local) {
       renderDictionaryEntry({
@@ -1198,120 +1576,298 @@ async function lookupDictionary(query, options = {}) {
         zh: english,
         shortGloss: english,
         translations: [english],
-        senses: [{ pos: "other", label: posInfo("other").label, defs: [{ en: english, zh: "" }] }],
+        senses: [{ pos: "other", label: posInfo("other").label, short: "", defs: [{ en: english, zh: "" }] }],
         source: "机器翻译"
       }, query);
     }
     return;
   }
 
+  // English word: paint the local lexicon immediately, then merge whichever of
+  // the backend and browser sources answers, fetched in parallel.
   const word = normalizeWord(query);
   const local = LEXICON[word];
   if (local) {
     renderDictionaryEntry(localToDict(local, word), query);
   } else {
-    $("#dictPanel").hidden = false;
-    $("#dictResult").innerHTML = `<div class="empty-state"><p class="result-placeholder">正在查询<span class="loading-dots"></span></p></div>`;
+    showDictLoading();
   }
 
-  let remote = null;
-  try {
-    remote = await fetchEnglishEntry(word);
-  } catch {
-    remote = null;
-  }
-  if (remote) {
-    const merged = { ...remote };
-    if (local) {
-      merged.zh = local.zh;
-      merged.shortGloss = (local.zh || "").split("；")[0];
-      merged.phonetic = local.phonetic || remote.phonetic;
-      merged.collocations = local.collocations || [];
-      merged.forms = local.forms || "";
-      merged.source = "WordNet · CC-CEDICT";
-    }
-    renderDictionaryEntry(merged, query);
+  const [backendEntry, browserEntry] = await Promise.all([
+    BACKEND_READY ? fetchBackendEntry(query).catch(() => null) : Promise.resolve(null),
+    word ? fetchMergedEntry(word).catch(() => null) : Promise.resolve(null)
+  ]);
+  if (dictStale()) return;
+
+  const remote =
+    backendEntry && backendEntry.senses.length
+      ? backendEntry
+      : browserEntry && browserEntry.senses.length
+        ? browserEntry
+        : null;
+  if (remote && remote.senses.length) {
+    renderDictionaryEntry(mergeLocalAndRemote(local, remote, query), query);
   } else if (!local) {
-    const wiki = await fetchWiktionary(word).catch(() => null);
-    if (wiki) {
-      renderDictionaryEntry(wiki, query);
-    } else {
-      emptyDictResult(`未找到 “${escapeHtml(query)}”，请检查拼写或联网重试`, query);
-    }
+    emptyDictResult(`未找到 “${escapeHtml(query)}”，请检查拼写或联网重试`, query);
   }
 }
 
-async function fetchEnglishEntry(word) {
-  const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`, {
-    signal: AbortSignal.timeout(5000)
-  });
-  if (!res.ok) return null;
-  const data = await res.json();
-  const first = data && data[0];
-  if (!first) return null;
+function showDictLoading() {
+  $("#dictPanel").hidden = false;
+  $("#dictResult").innerHTML = `<div class="empty-state"><p class="result-placeholder">正在查询<span class="loading-dots"></span></p></div>`;
+}
 
-  const senses = [];
-  const synonyms = new Set();
-  const antonyms = new Set();
-  (first.meanings || []).forEach((meaning) => {
-    const pos = meaning.partOfSpeech || "other";
-    const defs = (meaning.definitions || []).slice(0, 6).map((d) => ({ en: d.definition || "", zh: "", ex: d.example || "", exZh: "" }));
-    if (defs.length) senses.push({ pos, label: posInfo(pos).label, defs });
-    (meaning.synonyms || []).forEach((s) => synonyms.add(s));
-    (meaning.antonyms || []).forEach((a) => antonyms.add(a));
-    (meaning.definitions || []).forEach((d) => {
-      (d.synonyms || []).forEach((s) => synonyms.add(s));
-      (d.antonyms || []).forEach((a) => antonyms.add(a));
-    });
-  });
+const DEFS_PER_POS = 10;
+const RELATION_CAP = 20;
+const SOURCE_PRIORITY = { wordnet: 0, wiktionary: 1, dictionaryapi: 2, datamuse: 3 };
+const SOURCE_LABELS = {
+  wordnet: "WordNet",
+  wiktionary: "Wiktionary",
+  dictionaryapi: "DictionaryAPI",
+  datamuse: "Datamuse"
+};
+// Sources trusted to establish which parts of speech a word has. Datamuse is
+// deliberately excluded: it reports "into" as a noun and "the" as an adverb
+// because its vocabulary only covers noun/verb/adjective/adverb. WordNet is
+// listed for the merge order even though only the backend can reach the
+// corpus; the browser gets its WordNet senses through /lookup.
+const AUTHORITATIVE_SOURCES = ["wordnet", "wiktionary", "dictionaryapi"];
 
-  const phonetics = first.phonetics || [];
-  const ukEntry = phonetics.find((p) => /[-_]uk\./i.test(p.audio || "") || /UK/i.test(p.text || ""));
-  const usEntry = phonetics.find((p) => /[-_]us\./i.test(p.audio || "") || /US/i.test(p.text || ""));
-  const fallbackText = first.phonetic || (phonetics.find((p) => p.text) || {}).text || "";
-  const phoneticUK = (ukEntry && ukEntry.text) || fallbackText;
-  const phoneticUS = (usEntry && usEntry.text) || phoneticUK;
+function cleanGloss(text) {
+  return String(text || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\{\{[^{}]*\}\}/g, " ")
+    .replace(/\[\[([^\]|]*\|)?([^\]]*)\]\]/g, (match, prefix, label) => label || prefix || "")
+    .replace(/'''/g, "")
+    .replace(/''/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/\s+([,.;:!?%)\]])/g, "$1")
+    .replace(/([(\[])\s+/g, "$1")
+    .trim();
+}
 
-  return {
-    word: first.word || word,
-    phonetic: phoneticUK,
-    phoneticUK,
-    phoneticUS,
-    senses,
-    synonyms: [...synonyms].slice(0, 14),
-    antonyms: [...antonyms].slice(0, 14),
-    forms: "",
-    collocations: [],
-    source: "WordNet"
-  };
+function glossKey(text) {
+  return String(text || "").toLowerCase().replace(/[^a-z0-9一-鿿]+/g, "");
+}
+
+function exactHit(payload, word) {
+  if (!Array.isArray(payload)) return null;
+  const target = String(word || "").trim().toLowerCase();
+  return payload.find((item) => item && String(item.word || "").trim().toLowerCase() === target) || null;
+}
+
+async function fetchJson(url, timeout) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(timeout || 5000) });
+  if (!response.ok) throw new Error(`bad status ${response.status}`);
+  return response.json();
+}
+
+async function fetchDatamuse(word) {
+  const base = "https://api.datamuse.com/words";
+  const [entries, synonyms, antonyms] = await Promise.allSettled([
+    fetchJson(`${base}?sp=${encodeURIComponent(word)}&md=dp&max=5`),
+    fetchJson(`${base}?rel_syn=${encodeURIComponent(word)}&max=${RELATION_CAP}`),
+    fetchJson(`${base}?rel_ant=${encodeURIComponent(word)}&max=${RELATION_CAP}`)
+  ]);
+
+  const result = { source: "datamuse", definitions: [], synonyms: [], antonyms: [] };
+  // Datamuse answers with near misses when the exact word is unknown
+  // ("Lighting" returns "lightning", "slighting"), so only an exact match counts.
+  const entry = entries.status === "fulfilled" ? exactHit(entries.value, word) : null;
+  if (entry) {
+    for (const raw of entry.defs || []) {
+      const parts = String(raw).split("\t");
+      if (parts.length < 2) continue;
+      const text = cleanGloss(parts[1]);
+      if (text) result.definitions.push({ pos: normalizePos(parts[0]), en: text, ex: "" });
+    }
+  }
+
+  const collect = (settled) =>
+    settled.status === "fulfilled" && Array.isArray(settled.value)
+      ? settled.value.map((item) => String((item && item.word) || "").trim()).filter(Boolean)
+      : [];
+  const target = String(word || "").toLowerCase();
+  result.synonyms = collect(synonyms).filter((name) => name.toLowerCase() !== target);
+  result.antonyms = collect(antonyms).filter((name) => name.toLowerCase() !== target);
+  return result;
 }
 
 async function fetchWiktionary(word) {
-  const res = await fetch(`https://en.wiktionary.org/api/rest_v1/page/definition/${encodeURIComponent(word)}`, {
-    signal: AbortSignal.timeout(5000)
-  });
-  if (!res.ok) return null;
-  const data = await res.json();
-  const list = data.en || data[Object.keys(data)[0]];
-  if (!list || !list.length) return null;
-  const groups = {};
-  list.forEach((item) => {
-    const pos = item.partOfSpeech || "other";
-    groups[pos] = groups[pos] || [];
-    groups[pos].push({ en: item.definition || "", zh: "", ex: "", exZh: "" });
-  });
+  const url = `https://en.wiktionary.org/api/rest_v1/page/definition/${encodeURIComponent(word)}`;
+  const payload = await fetchJson(url);
+  const result = { source: "wiktionary", definitions: [], synonyms: [], antonyms: [] };
+
+  const language = detectLang(word);
+  const preferred = language === "zh"
+    ? ["zh", "cmn", "zh-hans", "zh-hant", "chinese", "mandarin"]
+    : ["en", "english"];
+  // The endpoint keys sections by language and its "other" section mixes
+  // several of them, so never fall back to every section: a Portuguese gloss
+  // presented as an English definition would be worse than showing nothing.
+  const sections = [];
+  for (const [key, value] of Object.entries(payload || {})) {
+    if (Array.isArray(value) && preferred.includes(String(key).toLowerCase())) sections.push(...value);
+  }
+
+  for (const section of sections) {
+    if (!section || typeof section !== "object") continue;
+    const pos = normalizePos(section.partOfSpeech);
+    for (const item of section.definitions || []) {
+      if (!item) continue;
+      const raw = typeof item === "string" ? item : item.definition;
+      const text = cleanGloss(Array.isArray(raw) ? raw.join(" ") : raw);
+      if (!text) continue;
+      let example = "";
+      for (const key of ["parsedExamples", "examples"]) {
+        const values = item[key];
+        if (values && values.length) {
+          const first = values[0];
+          example = cleanGloss(typeof first === "string" ? first : first.example || first.text || "");
+          if (example) break;
+        }
+      }
+      result.definitions.push({ pos, en: text, ex: example });
+    }
+  }
+  return result;
+}
+
+// A dictionaryapi.dev fetcher used to live here. It was removed from the browser
+// path because that host sends no Access-Control-Allow-Origin header, so every
+// call fails CORS; the backend still queries it in backend/app/online.py, where
+// CORS does not apply, and merges those senses into /lookup responses.
+
+function mergeSourceResults(results, word) {
+  const answered = results.filter(
+    (item) => item && (item.definitions.length || (item.synonyms || []).length || (item.antonyms || []).length)
+  );
+  if (!answered.length) return null;
+
+  const corroborated = new Set();
+  for (const item of answered) {
+    if (!AUTHORITATIVE_SOURCES.includes(item.source)) continue;
+    for (const definition of item.definitions) corroborated.add(definition.pos || "other");
+  }
+
+  const buckets = new Map();
+  for (const item of answered) {
+    for (const definition of item.definitions) {
+      const pos = definition.pos || "other";
+      // Datamuse senses outside a corroborated part of speech are dropped,
+      // unless Datamuse is the only source that answered.
+      if (item.source === "datamuse" && corroborated.size && !corroborated.has(pos)) continue;
+      if (!buckets.has(pos)) buckets.set(pos, []);
+      buckets.get(pos).push({ ...definition, source: item.source });
+    }
+  }
+
+  const senses = [];
+  const positions = [...buckets.keys()].sort((a, b) => posRank(a) - posRank(b));
+  for (const pos of positions) {
+    // Stable sort by source preference keeps each source's own sense order.
+    const entries = buckets
+      .get(pos)
+      .slice()
+      .sort((a, b) => (SOURCE_PRIORITY[a.source] ?? 9) - (SOURCE_PRIORITY[b.source] ?? 9));
+    const seen = new Set();
+    const defs = [];
+    for (const entry of entries) {
+      const key = glossKey(entry.en);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      defs.push({ en: entry.en, zh: "", ex: entry.ex || "", exZh: "" });
+      if (defs.length >= DEFS_PER_POS) break;
+    }
+    if (defs.length) {
+      senses.push({ pos, label: posInfo(pos).label, short: posInfo(pos).short, defs });
+    }
+  }
+  if (!senses.length) return null;
+
+  const mergeRelations = (field) => {
+    const values = [];
+    for (const item of answered) {
+      for (const value of item[field] || []) {
+        if (value && !values.includes(value)) values.push(value);
+      }
+    }
+    return values.slice(0, RELATION_CAP);
+  };
+
+  const contributing = Object.keys(SOURCE_LABELS).filter((name) =>
+    answered.some((item) => item.source === name)
+  );
+  const phonetics = answered.find((item) => item.phoneticUK || item.phoneticUS) || {};
+
   return {
     word,
-    phonetic: "",
-    phoneticUK: "",
-    phoneticUS: "",
-    senses: Object.entries(groups).map(([pos, defs]) => ({ pos, label: posInfo(pos).label, defs })),
-    synonyms: [],
-    antonyms: [],
+    senses,
+    synonyms: mergeRelations("synonyms"),
+    antonyms: mergeRelations("antonyms"),
     forms: "",
     collocations: [],
-    source: "Wiktionary / Kaikki"
+    phoneticUK: phonetics.phoneticUK || "",
+    phoneticUS: phonetics.phoneticUS || "",
+    sources: contributing,
+    source: contributing.map((name) => SOURCE_LABELS[name]).join(" · ")
   };
+}
+
+async function fetchMergedEntry(word) {
+  const query = String(word || "").trim();
+  if (!query) return null;
+  // dictionaryapi.dev is deliberately not queried from the browser: it sends no
+  // Access-Control-Allow-Origin header, so every call fails CORS and only adds
+  // console noise. The backend still uses it (see backend/app/online.py), where
+  // CORS does not apply.
+  const settled = await Promise.allSettled([fetchDatamuse(query), fetchWiktionary(query)]);
+  const results = settled.filter((item) => item.status === "fulfilled").map((item) => item.value);
+  return mergeSourceResults(results, query);
+}
+
+function mergeLocalAndRemote(local, remote, query) {
+  const merged = { ...remote };
+  if (!local) {
+    merged.word = merged.word || query;
+    return merged;
+  }
+
+  // Union the senses instead of letting the remote answer replace them: when
+  // one online source is unreachable it may describe only a single part of
+  // speech ("light" as a noun), and the built-in lexicon already knows better.
+  const localEntry = localToDict(local, query);
+  const byPos = new Map();
+  for (const sense of localEntry.senses) {
+    byPos.set(sense.pos, { ...sense, defs: sense.defs.slice() });
+  }
+  for (const sense of remote.senses) {
+    if (!byPos.has(sense.pos)) {
+      byPos.set(sense.pos, { pos: sense.pos, label: sense.label, short: sense.short, defs: sense.defs.slice() });
+      continue;
+    }
+    const target = byPos.get(sense.pos);
+    const seen = new Set(target.defs.map((def) => glossKey(def.en || def.zh || "")));
+    for (const def of sense.defs) {
+      const key = glossKey(def.en || def.zh || "");
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      target.defs.push(def);
+      if (target.defs.length >= DEFS_PER_POS) break;
+    }
+  }
+
+  merged.senses = [...byPos.values()].sort((a, b) => posRank(a.pos) - posRank(b.pos));
+  merged.zh = local.zh;
+  merged.shortGloss = (local.zh || "").split("；")[0];
+  merged.phoneticUK = local.phonetic || remote.phoneticUK;
+  merged.phoneticUS = remote.phoneticUS || local.phonetic || "";
+  merged.collocations = local.collocations || [];
+  merged.forms = local.forms || remote.forms || "";
+  merged.examples = local.examples || [];
+  merged.source = `${remote.source} · 内置词库`;
+  merged.word = merged.word || query;
+  return merged;
 }
 
 function setDictPos(pos) {
@@ -1338,8 +1894,134 @@ function toggleSaveWord(btn) {
   btn.classList.toggle("active", index < 0);
 }
 
+/* --- AI 对话 --- */
+
+const chatMessages = [];
+const CHAT_HISTORY_LIMIT = 20;
+let chatPending = false;
+
+function renderChatMessages() {
+  const list = $("#chatList");
+  const empty = $("#chatEmpty");
+  list.querySelectorAll(".chat-msg").forEach((node) => node.remove());
+  chatMessages.forEach((message) => {
+    const node = document.createElement("div");
+    node.className = `chat-msg ${message.role === "user" ? "user" : "bot"}`;
+    node.textContent = message.content;
+    list.appendChild(node);
+  });
+  if (empty) empty.hidden = chatMessages.length > 0;
+  list.scrollTop = list.scrollHeight;
+}
+
+function appendChatMessage(role, content) {
+  chatMessages.push({ role, content });
+  const list = $("#chatList");
+  const empty = $("#chatEmpty");
+  const node = document.createElement("div");
+  node.className = `chat-msg ${role === "user" ? "user" : "bot"}`;
+  node.textContent = content;
+  list.appendChild(node);
+  if (empty) empty.hidden = true;
+  list.scrollTop = list.scrollHeight;
+  return node;
+}
+
+// Send a message through the chat. `displayText`, when given, is what the user
+// sees in the bubble while `text` is what actually reaches the model — the
+// 解析当前译文 action sends a fuller instruction than the short label shown.
+async function submitChatText(text, displayText) {
+  if (chatPending) return;
+  const shown = displayText !== undefined ? displayText : text;
+  appendChatMessage("user", shown);
+
+  if (!BACKEND_READY) {
+    appendChatMessage(
+      "assistant",
+      "AI 对话需要后端服务：请先启动 backend（uvicorn app.main:app），并在 .env 中配置 DEEPSEEK_API_KEY。"
+    );
+    return;
+  }
+
+  const history = chatMessages.slice(-CHAT_HISTORY_LIMIT).map((m) => ({ role: m.role, content: m.content }));
+  history[history.length - 1].content = text;
+
+  chatPending = true;
+  const sendBtn = $("#chatSend");
+  if (sendBtn) sendBtn.disabled = true;
+  const pending = appendChatMessage("assistant", "正在思考…");
+
+  try {
+    const reply = await fetchChat(history, 45000);
+    if (reply) {
+      pending.textContent = reply;
+    } else {
+      pending.className = "chat-msg bot error";
+      pending.textContent = "未收到回复：请确认后端已配置 DEEPSEEK_API_KEY。";
+    }
+  } catch (error) {
+    pending.className = "chat-msg bot error";
+    pending.textContent = `请求失败：${error && error.message ? error.message : error}`;
+  } finally {
+    chatMessages[chatMessages.length - 1] = { role: "assistant", content: pending.textContent };
+    chatPending = false;
+    if (sendBtn) sendBtn.disabled = false;
+    const list = $("#chatList");
+    list.scrollTop = list.scrollHeight;
+    $("#chatInput").focus();
+  }
+}
+
+async function sendChatMessage() {
+  const input = $("#chatInput");
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  submitChatText(text);
+}
+
+// Manually parse the current translation inside the AI 对话 sheet. DeepSeek
+// 解析 is never triggered automatically by a translation; it only runs here,
+// on the user's request.
+function parseCurrentTranslation() {
+  if (!state.currentSource || !state.currentTranslation) {
+    toast("请先在主页翻译一段内容");
+    return;
+  }
+  const src = state.currentSrcLang || "en";
+  const tgt = state.currentTargetLang || "zh";
+  const display = `请解析：${state.currentSource} → ${state.currentTranslation}`;
+  if (!BACKEND_READY) {
+    appendChatMessage("user", display);
+    appendChatMessage("assistant", localInsightText(state.currentSource, src, tgt));
+    return;
+  }
+  submitChatText(buildInsightPrompt(state.currentSource, src, tgt, state.currentTranslation), display);
+}
+
+function updateParseButton() {
+  const btn = $("#parseCurrentBtn");
+  const hint = $("#parseHint");
+  const has = !!(state.currentSource && state.currentTranslation);
+  if (btn) btn.disabled = !has;
+  if (hint) hint.textContent = has ? `解析“${state.currentSource}”` : "先翻译内容，再点这里逐词解析";
+}
+
 function bindEvents() {
   $("#sourceInput").addEventListener("input", scheduleTranslate);
+  $("#chatBtn").addEventListener("click", openChatSheet);
+  $("#parseCurrentBtn").addEventListener("click", parseCurrentTranslation);
+  $("#chatClose").addEventListener("click", closeSheets);
+  $("#chatForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    sendChatMessage();
+  });
+  $("#chatInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage();
+    }
+  });
   $("#clearBtn").addEventListener("click", () => {
     $("#sourceInput").value = "";
     $("#charCount").textContent = "0 / 5000";
@@ -1347,8 +2029,12 @@ function bindEvents() {
     $("#sourceInput").focus();
   });
   $("#micBtn").addEventListener("click", () => {
+    const current = $("#sourceInput").value.trim();
+    // Empty input defaults to Chinese recognition — most users dictate in
+    // Chinese, and an English ASR would mangle Chinese speech.
+    const lang = current ? (detectLang(current) === "zh" ? "zh" : "en") : "zh";
     $("#sourceInput").focus();
-    startListening(detectLang($("#sourceInput").value) === "zh" ? "zh" : "en");
+    startListening(lang);
   });
   $("#scanBtn").addEventListener("click", openCamera);
   $("#lookupBtn").addEventListener("click", () => lookupDictionary());

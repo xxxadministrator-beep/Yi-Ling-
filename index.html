@@ -4,17 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#f6f8fc">
-  <title>译灵翻译 · 中英自动互译</title>
+  <title>译灵 · 中英自动互译</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <div class="app">
     <header class="appbar">
       <div class="brand">
-        <div class="brand-logo" aria-hidden="true"><span>译</span></div>
+        <div class="brand-logo" aria-hidden="true"><span>灵</span></div>
         <div class="brand-text">
-          <h1>译灵翻译</h1>
-          <p>中英自动互译 · 查词</p>
+          <h1>译灵</h1>
+          <p>中英自动互译 · 查词 · AI 对话</p>
         </div>
       </div>
       <div class="appbar-actions">
@@ -29,15 +29,19 @@
         <div class="panel source-card">
           <div class="panel-head">
             <span class="panel-label">原文</span>
-            <span class="char-count" id="charCount">0 / 5000</span>
+            <div class="panel-head-actions">
+              <span class="char-count" id="charCount">0 / 5000</span>
+              <button class="mini-btn" id="lookupBtn" data-icon="book" aria-label="查词"></button>
+              <button class="mini-btn" id="clearBtn" data-icon="x" aria-label="清空"></button>
+            </div>
           </div>
-          <textarea id="sourceInput" maxlength="5000" rows="4" placeholder="输入英文或中文，自动互译"></textarea>
-          <div class="panel-actions">
-            <button class="action-btn" id="micBtn" data-icon="mic" aria-label="语音输入"></button>
-            <button class="action-btn" id="scanBtn" data-icon="scan" aria-label="拍照翻译"></button>
-            <button class="action-btn" id="lookupBtn" data-icon="book" aria-label="查词"></button>
-            <span class="spacer"></span>
-            <button class="action-btn" id="clearBtn" data-icon="x" aria-label="清空"></button>
+          <textarea id="sourceInput" maxlength="5000" rows="2" placeholder="输入英文或中文，自动互译"></textarea>
+          <div class="input-actions">
+            <button class="round-btn slot-left" id="scanBtn" data-icon="scan" aria-label="拍照翻译"></button>
+            <button class="mic-main slot-center" id="micBtn" data-icon="mic" aria-label="语音输入"></button>
+            <button class="chat-btn slot-right" id="chatBtn" aria-label="AI对话">
+              <span class="inline-ic" data-icon="chat"></span><span>AI对话</span>
+            </button>
           </div>
         </div>
 
@@ -75,19 +79,37 @@
             </div>
           </div>
         </section>
-
-        <section class="ai-section" id="aiSection" hidden>
-          <div class="section-title">
-            <span class="inline-ic" data-icon="sparkles"></span>
-            <h2>辅助解析</h2>
-          </div>
-          <div id="aiContent" class="ai-content"></div>
-        </section>
       </div>
     </main>
   </div>
 
   <div class="scrim" id="scrim" hidden></div>
+
+  <div class="sheet" id="chatSheet" role="dialog" aria-modal="true" hidden>
+    <div class="sheet-grab"></div>
+    <div class="sheet-head">
+      <h2>AI 对话</h2>
+      <button class="icon-btn" id="chatClose" data-icon="x" aria-label="关闭"></button>
+    </div>
+    <div class="chat-toolbar">
+      <button class="chat-parse-btn" id="parseCurrentBtn" disabled>
+        <span class="inline-ic" data-icon="sparkles"></span><span>解析当前译文</span>
+      </button>
+      <span class="chat-toolbar-hint" id="parseHint">先翻译内容，再点这里逐词解析</span>
+    </div>
+    <div class="chat-body">
+      <div class="chat-list" id="chatList">
+        <div class="chat-empty" id="chatEmpty">
+          <span class="empty-ic" data-icon="chat"></span>
+          <p>hi，我是你的专属译灵，你可以用中文或英文向我提问。</p>
+        </div>
+      </div>
+      <form class="chat-input-row" id="chatForm">
+        <textarea id="chatInput" rows="1" maxlength="2000" placeholder="输入消息…"></textarea>
+        <button class="chat-send" id="chatSend" type="submit">发送</button>
+      </form>
+    </div>
+  </div>
 
   <div class="sheet" id="historySheet" role="dialog" aria-modal="true" hidden>
     <div class="sheet-grab"></div>
@@ -147,7 +169,7 @@
           <input id="accountPassword" type="password" autocomplete="current-password">
         </label>
         <button class="primary-btn account-submit" id="accountSubmit">登录</button>
-        <p class="account-hint">本地演示账户，数据仅保存在当前浏览器。</p>
+        <p class="account-hint">后端可用时账户保存在服务器数据库；离线时保存在当前浏览器。</p>
       </div>
       <div id="accountLoggedIn" hidden>
         <div class="profile-card">
@@ -197,10 +219,11 @@
       <div class="setting-block">
         <div class="setting-title about-title">关于</div>
         <p class="about-copy">
-          译灵翻译是一款中英自动互译与查词工具，界面参考 Google Translate 手机版，输入文字即可自动检测并翻译，单词会自动补充词典释义。
+          译灵是一款专用于中英自动互译、查词与 AI 对话的工具，界面参考 Google Translate 手机版：
+          输入文字自动检测语言并翻译，单词自动补充词典释义，底部可直接拍照、语音输入或打开 AI 对话。
         </p>
         <div class="tech-tags">
-          <span>CameraX</span><span>ML Kit</span><span>DeepSeek</span><span>CC-CEDICT</span><span>WordNet</span>
+          <span>CameraX</span><span>ML Kit</span><span>DeepSeek</span><span>CC-CEDICT</span><span>WordNet</span><span>Wiktionary</span><span>Datamuse</span>
         </div>
       </div>
     </div>

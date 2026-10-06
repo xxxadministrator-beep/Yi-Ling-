@@ -1,4 +1,16 @@
-"""Query and merge normalized dictionary entries from PostgreSQL."""
+"""Query and merge normalized dictionary entries.
+
+Two layers can answer a lookup:
+
+1. the local database, filled by the importers in app/importers from CC-CEDICT,
+   WordNet and Kaikki dumps;
+2. the live sources in app.online (WordNet corpus, Wiktionary, Datamuse,
+   dictionaryapi.dev) for anything the local corpus never saw.
+
+Both layers are merged into one normalized entry, and every definition keeps
+the source it came from so the client can show honest provenance instead of
+claiming a fixed list of dictionaries.
+"""
 
 from __future__ import annotations
 
@@ -9,56 +21,44 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import DictionaryEntry, DictionarySense
+from app.online import SOURCE_NAMES, dedupe_key, lemmatize_en, lookup_online, truncate
+from app.pos import normalize_pos, pos_label, pos_rank, pos_short
 
-POS_NORMALIZE = {
-    "n": "noun",
-    "noun": "noun",
-    "v": "verb",
-    "verb": "verb",
-    "adj": "adjective",
-    "a": "adjective",
-    "s": "adjective",
-    "adjective": "adjective",
-    "adv": "adverb",
-    "r": "adverb",
-    "adverb": "adverb",
-    "pron": "pronoun",
-    "pronoun": "pronoun",
-    "prep": "preposition",
-    "preposition": "preposition",
-    "conj": "conjunction",
-    "conjunction": "conjunction",
-    "int": "interjection",
-    "interjection": "interjection",
-    "det": "determiner",
-    "determiner": "determiner",
-    "num": "numeral",
-    "numeral": "numeral",
-    "part": "particle",
-    "particle": "particle",
+__all__ = [
+    "lookup_entry",
+    "lookup_word",
+    "normalize_pos",
+    "pos_label",
+    "pos_short",
+    "lemmatize_en",
+]
+
+DEFINITIONS_PER_POS = 10
+TRANSLATION_CAP = 12
+
+# Friendly names for the source column written by the importers.
+DB_SOURCE_NAMES = {
+    "cc-cedict": "CC-CEDICT",
+    "wordnet": "WordNet",
+    "wiktionary": "Wiktionary",
+    "kaikki": "Wiktionary",
 }
 
 
-def normalize_pos(pos: str) -> str:
-    return POS_NORMALIZE.get((pos or "").strip().lower(), "other")
+def friendly_source(name: str) -> str:
+    """Map an internal source key onto the label shown in the user interface."""
+    key = str(name or "").strip()
+    lowered = key.lower()
+    if lowered in DB_SOURCE_NAMES:
+        return DB_SOURCE_NAMES[lowered]
+    if lowered in SOURCE_NAMES:
+        return SOURCE_NAMES[lowered]
+    return key
 
 
-def lemmatize_en(word: str) -> str:
-    """Return a WordNet lemma when available, otherwise the lowercase word."""
-    lowered = word.strip().lower()
-    if not lowered:
-        return ""
-    try:
-        from nltk.stem import WordNetLemmatizer
-
-        lemmatizer = WordNetLemmatizer()
-        for pos in ("v", "n", "a", "r"):
-            lemma = lemmatizer.lemmatize(lowered, pos=pos)
-            if lemma != lowered:
-                return lemma
-        return lowered
-    except Exception:
-        return lowered
+# --------------------------------------------------------------------------- #
+# database layer
+# --------------------------------------------------------------------------- #
 
 
 def _load_entries(session: Session, words: set[str], lang: str) -> list[DictionaryEntry]:
@@ -66,48 +66,61 @@ def _load_entries(session: Session, words: set[str], lang: str) -> list[Dictiona
         return []
     stmt = (
         select(DictionaryEntry)
-        .options(selectinload(DictionaryEntry.senses), selectinload(DictionaryEntry.relations), selectinload(DictionaryEntry.forms))
+        .options(
+            selectinload(DictionaryEntry.senses),
+            selectinload(DictionaryEntry.relations),
+            selectinload(DictionaryEntry.forms),
+        )
         .where(DictionaryEntry.lang == lang, DictionaryEntry.word.in_(words))
     )
     return list(session.scalars(stmt).all())
 
 
-def _entry_senses(entry: DictionaryEntry) -> list[dict[str, Any]]:
-    return [
-        {
-            "pos": normalize_pos(sense.pos),
-            "definition_en": sense.definition_en or "",
-            "definition_zh": sense.definition_zh or "",
-            "example": sense.example or "",
-        }
-        for sense in sorted(entry.senses, key=lambda s: (s.order, s.id))
-    ]
+def _sense_items(entries: list[DictionaryEntry]) -> list[dict[str, Any]]:
+    """Flatten stored senses into source-tagged definition items."""
+    items: list[dict[str, Any]] = []
+    for entry in entries:
+        label = friendly_source(entry.source) or "数据库"
+        for sense in sorted(entry.senses, key=lambda item: (item.order, item.id)):
+            items.append(
+                {
+                    "pos": normalize_pos(sense.pos),
+                    "en": sense.definition_en or "",
+                    "zh": sense.definition_zh or "",
+                    "ex": sense.example or "",
+                    "source": label,
+                }
+            )
+    return items
 
 
 def _entry_relations(entries: list[DictionaryEntry]) -> dict[str, list[str]]:
-    grouped: dict[str, set[str]] = defaultdict(set)
+    grouped: dict[str, list[str]] = defaultdict(list)
     for entry in entries:
-        for rel in entry.relations:
-            grouped[rel.rel_type].add(rel.target)
-    return {key: sorted(values) for key, values in grouped.items()}
+        for relation in entry.relations:
+            if relation.target not in grouped[relation.rel_type]:
+                grouped[relation.rel_type].append(relation.target)
+    return {key: truncate(values) for key, values in grouped.items()}
 
 
 def _entry_forms(entries: list[DictionaryEntry]) -> list[str]:
-    forms: set[str] = set()
+    forms: list[str] = []
     for entry in entries:
         for form in entry.forms:
-            forms.add(form.form)
-    return sorted(forms)
+            if form.form and form.form not in forms:
+                forms.append(form.form)
+    return truncate(forms, 24)
 
 
 def _collect_translations(entries: list[DictionaryEntry], lang: str) -> list[str]:
     values: list[str] = []
     for entry in entries:
-        for sense in entry.senses:
+        for sense in sorted(entry.senses, key=lambda item: (item.order, item.id)):
             text = sense.definition_zh if lang == "en" else sense.definition_en
+            text = (text or "").strip()
             if text and text not in values:
                 values.append(text)
-    return values[:12]
+    return values
 
 
 def _reverse_cedict(session: Session, english_word: str) -> list[str]:
@@ -120,68 +133,58 @@ def _reverse_cedict(session: Session, english_word: str) -> list[str]:
     return [row[0] for row in session.execute(stmt).all()]
 
 
-def lookup_entry(session: Session, word: str, lang: str | None = None) -> dict[str, Any] | None:
-    word = word.strip()
-    if not word:
-        return None
+def _db_sources(entries: list[DictionaryEntry]) -> list[str]:
+    names: list[str] = []
+    for entry in entries:
+        label = friendly_source(entry.source)
+        if label and label not in names:
+            names.append(label)
+    return names
 
-    detected = lang or ("zh" if any("\u4e00" <= ch <= "\u9fff" for ch in word) else "en")
-    if detected == "en":
+
+def _db_entry(session: Session, word: str, lang: str) -> dict[str, Any] | None:
+    """Build an entry from the local database alone (no network)."""
+    if lang == "en":
         variants = {word.lower(), lemmatize_en(word)}
         entries = _load_entries(session, variants, "en")
         if not entries:
             return None
-
-        senses: list[dict[str, Any]] = []
-        for entry in entries:
-            for sense in _entry_senses(entry):
-                senses.append(sense)
-
-        relations = _entry_relations(entries)
-        forms = _entry_forms(entries)
+        items = _sense_items(entries)
         translations = _collect_translations(entries, "en")
-        reverse = _reverse_cedict(session, word.lower())
-        for zh_word in reverse:
+        for zh_word in _reverse_cedict(session, word.lower()):
             if zh_word not in translations:
                 translations.append(zh_word)
-        phonetics = next(
-            (e for e in entries if e.phonetic_uk or e.phonetic_us),
-            entries[0] if entries else None,
-        )
+        relations = _entry_relations(entries)
+        phonetics = next((e for e in entries if e.phonetic_uk or e.phonetic_us), entries[0])
         return {
             "word": word,
             "language": "en",
-            "phonetic_uk": (phonetics.phonetic_uk if phonetics else "") or "",
-            "phonetic_us": (phonetics.phonetic_us if phonetics else "") or "",
+            "phonetic_uk": phonetics.phonetic_uk or "",
+            "phonetic_us": phonetics.phonetic_us or "",
             "pinyin": "",
-            "senses": _group_senses(senses),
+            "items": items,
             "synonyms": relations.get("synonym", []),
             "antonyms": relations.get("antonym", []),
             "hyponyms": relations.get("hyponym", []),
             "hypernyms": relations.get("hypernym", []),
-            "forms": forms,
-            "translations": translations,
-            "source": "CC-CEDICT · WordNet · Wiktionary",
+            "forms": _entry_forms(entries),
+            "translations": truncate(translations, TRANSLATION_CAP),
+            "sources_used": _db_sources(entries),
         }
 
     entries = _load_entries(session, {word}, "zh")
     if not entries:
         return None
 
+    # CC-CEDICT stores English glosses, so the English entries those glosses
+    # point at supply part-of-speech and semantic relations for a Chinese word.
     glosses = [sense.definition_en for entry in entries for sense in entry.senses if sense.definition_en]
+    items = _sense_items(entries)
     english_entries: list[DictionaryEntry] = []
     for gloss in glosses[:4]:
-        first_word = gloss.split()[0].strip(".,;:()[]")
-        english_entries.extend(_load_entries(session, {first_word, lemmatize_en(first_word)}, "en"))
-
-    merged_senses: list[dict[str, Any]] = []
-    for entry in entries:
-        for sense in _entry_senses(entry):
-            merged_senses.append(sense)
-    if english_entries:
-        for entry in english_entries:
-            for sense in _entry_senses(entry):
-                merged_senses.append(sense)
+        first_word = gloss.split()[0].strip(".,;:()[]") if gloss.split() else ""
+        if first_word:
+            english_entries.extend(_load_entries(session, {first_word, lemmatize_en(first_word)}, "en"))
 
     relations = _entry_relations(english_entries)
     pinyin = next((entry.pinyin for entry in entries if entry.pinyin), "")
@@ -191,48 +194,155 @@ def lookup_entry(session: Session, word: str, lang: str | None = None) -> dict[s
         "phonetic_uk": "",
         "phonetic_us": "",
         "pinyin": pinyin,
-        "senses": _group_senses(merged_senses),
+        "items": items + _sense_items(english_entries),
         "synonyms": relations.get("synonym", []),
         "antonyms": relations.get("antonym", []),
         "hyponyms": relations.get("hyponym", []),
         "hypernyms": relations.get("hypernym", []),
         "forms": [],
-        "translations": glosses[:12],
-        "source": "CC-CEDICT · WordNet · Wiktionary",
+        "translations": truncate(glosses, TRANSLATION_CAP),
+        "sources_used": _db_sources(entries + english_entries),
     }
 
 
-def _group_senses(senses: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for sense in senses:
-        grouped[sense["pos"]].append(sense)
+# --------------------------------------------------------------------------- #
+# merging
+# --------------------------------------------------------------------------- #
 
-    result: list[dict[str, Any]] = []
-    for pos, items in grouped.items():
+
+def _group_definitions(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group definition items by part of speech, preserving arrival order."""
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in items:
+        # Normalize defensively: an unnormalized key would reach the client as
+        # an unlabelled part of speech.
+        grouped[normalize_pos(item.get("pos"))].append(item)
+
+    senses: list[dict[str, Any]] = []
+    for pos in sorted(grouped, key=pos_rank):
+        seen: set[str] = set()
         definitions: list[dict[str, Any]] = []
-        for item in items:
+        for item in grouped[pos]:
+            key = dedupe_key(item.get("en") or item.get("zh") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
             definitions.append(
                 {
-                    "en": item.get("definition_en", ""),
-                    "zh": item.get("definition_zh", ""),
-                    "ex": item.get("example", ""),
+                    "en": item.get("en", ""),
+                    "zh": item.get("zh", ""),
+                    "ex": item.get("ex", ""),
+                    "source": item.get("source", ""),
                 }
             )
-        result.append({"pos": pos, "label": pos_label(pos), "definitions": definitions})
-    return result
+            if len(definitions) >= DEFINITIONS_PER_POS:
+                break
+        if definitions:
+            senses.append(
+                {
+                    "pos": pos,
+                    "label": pos_label(pos),
+                    "short": pos_short(pos),
+                    "definitions": definitions,
+                }
+            )
+    return senses
 
 
-def pos_label(pos: str) -> str:
+def _online_to_items(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for sense in entry.get("senses", []):
+        for definition in sense.get("definitions", []):
+            items.append(
+                {
+                    "pos": normalize_pos(sense.get("pos")),
+                    "en": definition.get("en", ""),
+                    "zh": definition.get("zh", ""),
+                    "ex": definition.get("ex", ""),
+                    "source": friendly_source(definition.get("source") or entry.get("source", "")),
+                }
+            )
+    return items
+
+
+def _merge_entries(
+    word: str,
+    lang: str,
+    db_entry: dict[str, Any] | None,
+    online_entry: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Combine the database entry and the online entry into one response."""
+    layers = [entry for entry in (db_entry, online_entry) if entry]
+    if not layers:
+        return None
+
+    items: list[dict[str, Any]] = []
+    for entry in layers:
+        if entry is db_entry:
+            items.extend(entry.get("items", []))
+        else:
+            items.extend(_online_to_items(entry))
+
+    senses = _group_definitions(items)
+    if not senses:
+        return None
+
+    sources_used: list[str] = []
+    translations: list[str] = []
+    forms: list[str] = []
+    relations: dict[str, list[str]] = {}
+    for entry in layers:
+        for name in entry.get("sources_used") or []:
+            label = friendly_source(name)
+            if label and label not in sources_used:
+                sources_used.append(label)
+        translations.extend(entry.get("translations") or [])
+        forms.extend(entry.get("forms") or [])
+        for key in ("synonyms", "antonyms", "hyponyms", "hypernyms"):
+            for value in entry.get(key) or []:
+                relations.setdefault(key, []).append(value)
+
     return {
-        "noun": "名词",
-        "verb": "动词",
-        "adjective": "形容词",
-        "adverb": "副词",
-        "pronoun": "代词",
-        "preposition": "介词",
-        "conjunction": "连词",
-        "interjection": "感叹词",
-        "determiner": "限定词",
-        "numeral": "数词",
-        "particle": "助词",
-    }.get(pos, "其他")
+        "word": word,
+        "language": lang,
+        "phonetic_uk": (db_entry or {}).get("phonetic_uk") or (online_entry or {}).get("phonetic_uk") or "",
+        "phonetic_us": (db_entry or {}).get("phonetic_us") or (online_entry or {}).get("phonetic_us") or "",
+        "pinyin": (db_entry or {}).get("pinyin") or (online_entry or {}).get("pinyin") or "",
+        "senses": senses,
+        "synonyms": truncate(relations.get("synonyms", [])),
+        "antonyms": truncate(relations.get("antonyms", [])),
+        "hyponyms": truncate(relations.get("hyponyms", [])),
+        "hypernyms": truncate(relations.get("hypernyms", [])),
+        "forms": truncate(forms, 24),
+        "translations": truncate(translations, TRANSLATION_CAP),
+        "source": " · ".join(sources_used),
+        "sources_used": sources_used,
+        "pos_count": len(senses),
+    }
+
+
+def lookup_entry(session: Session, word: str, lang: str | None = None) -> dict[str, Any] | None:
+    """Database-only lookup, kept for callers that must not touch the network."""
+    text = str(word or "").strip()
+    if not text:
+        return None
+    detected = lang or ("zh" if any("一" <= ch <= "鿿" for ch in text) else "en")
+    db_entry = _db_entry(session, text, detected)
+    if not db_entry:
+        return None
+    return _merge_entries(text, detected, db_entry, None)
+
+
+async def lookup_word(session: Session, word: str, lang: str | None = None) -> dict[str, Any] | None:
+    """Look up a word in the local database and the live online sources."""
+    text = str(word or "").strip()
+    if not text:
+        return None
+    detected = lang or ("zh" if any("一" <= ch <= "鿿" for ch in text) else "en")
+
+    db_entry = _db_entry(session, text, detected)
+    try:
+        online_entry = await lookup_online(text, detected)
+    except Exception:
+        online_entry = None
+    return _merge_entries(text, detected, db_entry, online_entry)

@@ -61,3 +61,25 @@ class DictionaryForm(Base):
     form_type: Mapped[str] = mapped_column(String(32), default="form")
 
     entry: Mapped[DictionaryEntry] = relationship(back_populates="forms")
+
+
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (UniqueConstraint("email", name="uq_users_email"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(64), default="")
+    email: Mapped[str] = mapped_column(String(128), index=True)
+    # PBKDF2-SHA256 hash in the form "<salt_hex>$<digest_hex>"; never store the
+    # plaintext password.
+    password_hash: Mapped[str] = mapped_column(String(256))
+    created_at: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AuthToken(Base):
+    __tablename__ = "auth_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[int] = mapped_column(Integer, default=0)
