@@ -599,7 +599,11 @@ async function lookupChineseViaEnglish(env, word) {
 // accounts (D1 + PBKDF2-HMAC-SHA256)
 // ---------------------------------------------------------------------------
 
-const PBKDF2_ITERATIONS = 120000;
+// Cloudflare Workers caps WebCrypto PBKDF2 at 100,000 iterations, and the Free
+// plan's per-request CPU budget makes high counts exceed the limit. 20,000 is a
+// reasonable demo-level tradeoff; raise it on a Paid plan if stronger hashing is
+// required.
+const PBKDF2_ITERATIONS = 20000;
 
 function bytesToHex(bytes) {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -806,6 +810,7 @@ export default {
         return json({ user: publicUser(user) });
       }
     } catch (error) {
+      console.error("Worker error:", error);
       if (error instanceof DeepSeekError && error.kind === "http") {
         return json({ detail: `DeepSeek request failed: ${error.status}` }, 502);
       }

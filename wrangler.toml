@@ -10,7 +10,7 @@ not_found_handling = "single-page-application"
 [[d1_databases]]
 binding = "DB"
 database_name = "yiling"
-database_id = "REPLACE_WITH_DATABASE_ID"
+database_id = "1daf695b-c053-4792-a079-95c33f99a082"
 
 [vars]
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
