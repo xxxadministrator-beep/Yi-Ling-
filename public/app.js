@@ -163,7 +163,7 @@ const CURRENT_USER_KEY = "yiling_current_user";
 const TOKEN_KEY = "yiling_token";
 const API_BASE =
   window.YILING_API_BASE ||
-  (window.location.protocol.startsWith("http") ? window.location.origin : "http://localhost:8000");
+  (window.location.protocol.startsWith("http") ? window.location.origin :"http://127.0.0.1:8787");
 let BACKEND_READY = false;
 
 function storageKeys() {
@@ -207,7 +207,7 @@ function detectLang(text) {
 
 async function checkBackend() {
   try {
-    const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(1500) });
+    const res = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(5000) });
     BACKEND_READY = res.ok;
   } catch {
     BACKEND_READY = false;
@@ -1935,10 +1935,11 @@ async function submitChatText(text, displayText) {
   const shown = displayText !== undefined ? displayText : text;
   appendChatMessage("user", shown);
 
+  if (!BACKEND_READY) await checkBackend();
   if (!BACKEND_READY) {
     appendChatMessage(
       "assistant",
-      "AI 对话需要后端服务：请先启动 backend（uvicorn app.main:app），并在 .env 中配置 DEEPSEEK_API_KEY。"
+      "无法连接后端服务，请确认 wrangler dev 正在运行，然后刷新页面重试。"
     );
     return;
   }

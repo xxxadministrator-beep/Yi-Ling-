@@ -13,5 +13,6 @@ database_name = "yiling"
 database_id = "1daf695b-c053-4792-a079-95c33f99a082"
 
 [vars]
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_BASE_URL = "https://oaks-qui-studied-workshops.trycloudflare.com/v1"
+DEEPSEEK_MODEL = "gemma:2b"
+LLM_MIN_TIMEOUT_MS = "90000"

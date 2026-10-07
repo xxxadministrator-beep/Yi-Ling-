@@ -10,6 +10,9 @@
 //   POST /auth/register   -> create account (PBKDF2 hash, D1)
 //   POST /auth/login      -> login (D1)
 //   GET  /auth/me         -> resolve a Bearer token
+//
+// LLM backend is any OpenAI-compatible endpoint: DeepSeek cloud, or a local
+// Ollama (DEEPSEEK_BASE_URL=http://localhost:11434/v1, model deepseek-r1:1.5b).
 
 // ---------------------------------------------------------------------------
 // part-of-speech model (ported from backend/app/pos.py)
@@ -214,43 +217,102 @@ function deepseekConfig(env) {
   };
 }
 
+// deepseek-r1 emits its reasoning as <think>...</think> inside `content`
+// (and sometimes only the closing tag, or a never-closed block when cut off).
+function stripThink(text) {
+  return String(text || "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/^[\s\S]*?<\/think>/i, "")
+    .replace(/<think>[\s\S]*$/i, "")
+    .trim();
+}
+
 async function deepseekCompletion(env, messages, { temperature = 0.2, timeout = 45000 } = {}) {
   const { apiKey, baseUrl, model } = deepseekConfig(env);
   if (!apiKey) throw new DeepSeekError("unconfigured");
 
+  // Small local models are slow: LLM_MIN_TIMEOUT_MS raises every call's floor.
+  const ms = Math.max(timeout, Number(env.LLM_MIN_TIMEOUT_MS) || 0);
+  const headers = { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" };
+  // Optional: Cloudflare Access service token in front of a tunnelled Ollama.
+  if (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
+    headers["CF-Access-Client-Id"] = env.CF_ACCESS_CLIENT_ID;
+    headers["CF-Access-Client-Secret"] = env.CF_ACCESS_CLIENT_SECRET;
+  }
+
   const response = await fetchWithTimeout(
     `${baseUrl}/chat/completions`,
-    {
-      method: "POST",
-      headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model, messages, temperature }),
-    },
-    timeout,
+    { method: "POST", headers, body: JSON.stringify({ model, messages, temperature, stream: false }) },
+    ms,
   );
   if (!response.ok) throw new DeepSeekError("http", response.status);
   const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content;
-  return String(content || "").trim();
+  return stripThink(data?.choices?.[0]?.message?.content);
 }
 
-async function deepseekTranslate(env, text, source, target, timeout = 45000) {
+const CHUNK_LIMIT = 300;
+
+// Split long text on sentence/paragraph boundaries so a small model sees
+// short inputs. Short text comes back as a single chunk.
+function splitForTranslation(text, limit = CHUNK_LIMIT) {
+  if (text.length <= limit) return [text];
+  const pieces = text.match(/[^。！？!?.\n]+[。！？!?.]*\s*|\n+/g) || [text];
+  const chunks = [];
+  let current = "";
+  for (const piece of pieces) {
+    if (current && current.length + piece.length > limit) {
+      chunks.push(current);
+      current = "";
+    }
+    current += piece;
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function cleanTranslation(raw) {
+  return stripThink(raw)
+    .replace(/^(译文|翻译|Translation)\s*[:：]\s*/i, "")
+    .replace(/^["“「](.*)["”」]$/s, "$1")
+    .trim();
+}
+
+function glossaryHint(glossary) {
+  const rows = (Array.isArray(glossary) ? glossary : [])
+    .filter((g) => g && g.src && g.tgt)
+    .slice(0, 30)
+    .map((g) => `${String(g.src).slice(0, 60)} => ${String(g.tgt).slice(0, 60)}`);
+  return rows.length ? `\n术语表（必须按此翻译）：\n${rows.join("\n")}\n` : "";
+}
+
+async function deepseekTranslate(env, text, source, target, timeout = 45000, glossary = []) {
   const fromName = source === "zh" ? "中文" : "英语";
   const toName = target === "zh" ? "中文" : "英语";
-  const prompt = `你是专业的英中翻译。请把下面的${fromName}翻译成自然、地道的${toName}，只返回译文本身，不要解释：\n\n${text}`;
-  return deepseekCompletion(
-    env,
-    [
-      { role: "system", content: "You are a professional translator." },
-      { role: "user", content: prompt },
-    ],
-    { timeout },
-  );
+  const hint = glossaryHint(glossary);
+  const out = [];
+  for (const chunk of splitForTranslation(text)) {
+    if (!chunk.trim()) { out.push(chunk.includes("\n") ? "\n" : ""); continue; }
+    const prompt =
+      `把下面的${fromName}翻译成自然、地道的${toName}。只输出译文，不要解释，不要加引号。\n${hint}\n${chunk.trim()}`;
+    const result = await deepseekCompletion(
+      env,
+      [
+        { role: "system", content: "You are a professional translator. Output only the translation." },
+        { role: "user", content: prompt },
+      ],
+      { timeout },
+    );
+    // keep the source's paragraph breaks; otherwise glue sentences by language
+    out.push(cleanTranslation(result) + (/\n\s*$/.test(chunk) ? "\n" : target === "zh" ? "" : " "));
+  }
+  return out.join("").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 const CHAT_SYSTEM_PROMPT =
-  "你是译灵翻译的 AI 助手，服务中文用户学习英语（也支持英语用户学习中文）。" +
-  "回答时用简体中文，必要时给出英文对应表达。解释单词时说明词性、常见搭配和例句；" +
-  "翻译时给出自然、地道的译文，并在需要时补充更口语或更正式的说法。回答保持简洁。";
+  "你是「译灵翻译」应用里的 AI 助手，帮助中文用户学习英语，也支持英语用户学习中文。" +
+  "先判断用户这句话想做什么：如果是打招呼、闲聊或提问（例如“你是谁”），就直接用简体中文简短回答，不要当作单词来讲解；" +
+  "只有用户明确要求翻译，或询问某个词的意思时，才给出译文、词性、搭配和例句。" +
+  "只回答用户最新的一句话，不要重复之前的回答。回答保持简洁。";
 
 // ---------------------------------------------------------------------------
 // builtin mini dictionary
@@ -653,6 +715,55 @@ function publicUser(user) {
 }
 
 // ---------------------------------------------------------------------------
+// cache + rate limit (D1). Both fail open: if the tables are missing the app
+// still works, just without caching / limiting.
+// ---------------------------------------------------------------------------
+
+const CACHE_TTL_SECONDS = 30 * 24 * 3600;
+
+async function cacheGet(env, key) {
+  try {
+    const row = await env.DB.prepare("SELECT value, created_at FROM kv_cache WHERE key = ?").bind(key).first();
+    if (!row) return null;
+    if (Math.floor(Date.now() / 1000) - row.created_at > CACHE_TTL_SECONDS) return null;
+    return JSON.parse(row.value);
+  } catch {
+    return null;
+  }
+}
+
+async function cachePut(env, key, value) {
+  try {
+    await env.DB.prepare("INSERT OR REPLACE INTO kv_cache (key, value, created_at) VALUES (?, ?, ?)")
+      .bind(key, JSON.stringify(value), Math.floor(Date.now() / 1000)).run();
+  } catch {}
+}
+
+// Fixed one-minute window per (client, scope). Returns a 429 Response when
+// over the limit, otherwise null.
+async function rateLimited(env, request, scope, defaultLimit) {
+  const limit = Number(env.RATE_LIMIT_PER_MIN) > 0 ? Number(env.RATE_LIMIT_PER_MIN) : defaultLimit;
+  const ip = request.headers.get("CF-Connecting-IP") || "local";
+  const bucket = Math.floor(Date.now() / 60000);
+  try {
+    const row = await env.DB.prepare(
+      "INSERT INTO rate_limit (key, bucket, count) VALUES (?, ?, 1) " +
+      "ON CONFLICT(key) DO UPDATE SET count = CASE WHEN bucket = excluded.bucket THEN count + 1 ELSE 1 END, " +
+      "bucket = excluded.bucket RETURNING count",
+    ).bind(`${scope}:${ip}`, bucket).first();
+    if (row && row.count > limit) {
+      return json({ detail: "请求过于频繁，请稍后再试" }, 429, { "Retry-After": "60" });
+    }
+  } catch {}
+  return null;
+}
+
+function fullyTranslated(entry) {
+  if (entry.language !== "en") return true;
+  return (entry.senses || []).every((s) => (s.definitions || []).every((d) => !d.en || d.zh));
+}
+
+// ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
@@ -739,8 +850,19 @@ export default {
         const builtin = builtinTranslate(text, source, targetLang);
         if (builtin) return json({ translation: builtin, engine: "builtin" });
 
+        const glossary = Array.isArray(body.glossary) ? body.glossary : [];
+        const cacheKey = `tr:${source}>${targetLang}:${text}`;
+        const cacheable = text.length <= 1000 && !glossary.length;
+        if (cacheable) {
+          const hit = await cacheGet(env, cacheKey);
+          if (hit) return json({ translation: hit, engine: "cache" });
+        }
+        const blocked = await rateLimited(env, request, "translate", 20);
+        if (blocked) return blocked;
+
         try {
-          const translation = await deepseekTranslate(env, text, source, targetLang);
+          const translation = await deepseekTranslate(env, text, source, targetLang, 45000, glossary);
+          if (translation && cacheable) await cachePut(env, cacheKey, translation);
           return json({ translation, engine: "deepseek" });
         } catch (error) {
           if (error instanceof DeepSeekError && error.kind === "unconfigured") {
@@ -752,11 +874,13 @@ export default {
 
       if (method === "POST" && path === "/chat") {
         const body = await request.json().catch(() => ({}));
-        const history = (body.messages || []).slice(-20).map((m) => ({
+        const history = (body.messages || []).slice(-6).map((m) => ({
           role: m.role === "system" || m.role === "assistant" ? m.role : "user",
           content: String(m.content || ""),
         }));
         const messages = [{ role: "system", content: CHAT_SYSTEM_PROMPT }, ...history];
+        const blocked = await rateLimited(env, request, "chat", 20);
+        if (blocked) return blocked;
         try {
           const reply = await deepseekCompletion(env, messages, { temperature: 0.6 });
           return json({ reply, engine: "deepseek" });
@@ -774,6 +898,12 @@ export default {
         if (!word) return json({ senses: [] }, 422);
         const source = detectLang(word);
 
+        const lookupKey = `lk:${source}:${word.toLowerCase()}`;
+        const cachedEntry = await cacheGet(env, lookupKey);
+        if (cachedEntry) return json(cachedEntry);
+        const blocked = await rateLimited(env, request, "lookup", 60);
+        if (blocked) return blocked;
+
         let entry = await lookupOnline(word, source);
         if ((!entry || !entry.senses || !entry.senses.length) && source === "zh") {
           entry = await lookupChineseViaEnglish(env, word);
@@ -783,6 +913,8 @@ export default {
             await translateDefinitionsZh(env, word, entry.senses);
             refreshTranslations(entry);
           }
+          // Only cache complete entries, so a timed-out LLM call isn't frozen in.
+          if (fullyTranslated(entry)) await cachePut(env, lookupKey, entry);
           return json(entry);
         }
         return json(builtinEntry(word, source));
@@ -816,6 +948,8 @@ export default {
         const body = await request.json().catch(() => ({}));
         const email = String(body.email || "").trim().toLowerCase();
         const password = String(body.password || "");
+        const blocked = await rateLimited(env, request, "login", 10);
+        if (blocked) return blocked;
         const user = await env.DB.prepare("SELECT * FROM users WHERE email = ?").bind(email).first();
         if (!user || !(await verifyPassword(password, user.password_hash))) {
           return json({ detail: "邮箱或密码不正确" }, 401);
